@@ -14,20 +14,17 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import os
 import subprocess
 import sys
-import threading
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import pytest
 from login_fake import FakeApi, FakeError
+from web_site import CHANNEL, ROWS, Site, orders_html
 
 from since.collect import CollectResult, register_sources, run_collection
 from since.config import Config, ConfigError, SourceConfig
@@ -58,7 +55,6 @@ from since.sources.web import (
 from since.store import Store
 
 T0 = datetime(2026, 9, 29, 9, 0, 0, tzinfo=UTC)
-CHANNEL = os.environ.get("SINCE_TEST_BROWSER_CHANNEL") or None
 SOURCE_ID = "sps-portal"
 SELECTOR_ROWS = "table#orders tbody tr"
 EXTRACT: dict[str, Any] = {
@@ -844,141 +840,6 @@ def test_login_rejects_an_invalid_web_config_before_launching() -> None:
 
 
 # -- real browser --------------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="session")
-def browser_ok() -> None:
-    """Skip browser tests when no browser can be launched (checked once per session)."""
-    api = pytest.importorskip("playwright.sync_api")
-    pw = None
-    try:
-        pw = api.sync_playwright().start()
-        pw.chromium.launch(headless=True, channel=CHANNEL).close()
-    except Exception as exc:
-        first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
-        reason = (
-            "no browser can be launched (run `playwright install chromium`, or set "
-            f"SINCE_TEST_BROWSER_CHANNEL=msedge): {first[:150]}"
-        )
-        if os.environ.get("CI"):  # CI installs Chromium: a browser that will not start is a failure
-            pytest.fail(reason)
-        pytest.skip(reason)
-    finally:
-        if pw is not None:
-            with contextlib.suppress(Exception):
-                pw.stop()
-
-
-class Site:
-    """Static pages from a tmp dir, served on 127.0.0.1. ``/orders`` serves ``orders.html`` (or a
-    redirect to ``/login.html`` while ``logged_in`` is false); ``/slow`` answers only once
-    ``release`` is set."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.logged_in = True
-        self.release = threading.Event()
-        site = self
-
-        class Handler(SimpleHTTPRequestHandler):
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                super().__init__(*args, directory=str(root), **kwargs)
-
-            def log_message(self, format: str, *args: Any) -> None:
-                pass
-
-            def end_headers(self) -> None:
-                self.send_header("Cache-Control", "no-store")
-                super().end_headers()
-
-            def do_GET(self) -> None:
-                path = urlsplit(self.path).path
-                if path == "/orders" and not site.logged_in:
-                    self.send_response(302)
-                    self.send_header("Location", "/login.html")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                if path == "/orders":
-                    self.path = "/orders.html"
-                elif path == "/slow":
-                    site.release.wait(30)
-                    self.path = "/orders.html"
-                super().do_GET()
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-
-    def url(self, path: str = "/orders") -> str:
-        return f"http://127.0.0.1:{self.server.server_address[1]}{path}"
-
-    def write(self, name: str, html: str) -> None:
-        (self.root / name).write_text(html, encoding="utf-8")
-
-    def close(self) -> None:
-        self.release.set()
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(5)
-
-
-@pytest.fixture
-def site(browser_ok: None, tmp_path: Path) -> Iterator[Site]:
-    root = tmp_path / "www"
-    root.mkdir()
-    s = Site(root)
-    s.write("login.html", '<html><body><form id="login"><input name="user"></form></body></html>')
-    try:
-        yield s
-    finally:
-        s.close()
-
-
-ROWS = [
-    ("4500123", "Widget", "Open"),
-    ("4500124", "Gadget", "Open"),
-    ("4500125", "Gizmo", "Shipped"),
-]
-
-
-def orders_html(
-    rows: list[tuple[str, str, str]],
-    *,
-    extra_rows: str = "",
-    wrapper: str = "shell",
-    table_class: str = "grid wide",
-    body_attr: str = "",
-    head_extra: str = "",
-    banner: str = "",
-    leaf: str = "em",
-    table_id: str = "orders",
-) -> str:
-    """A portal page. Row ``(po, item, status)``: ``item`` is a link text, or no link if empty.
-    Rows alternate ``odd`` / ``even`` classes like a striped table."""
-    body = ""
-    for i, (po, item, status) in enumerate(rows):
-        link = f'<a href="/po/{po}">{item}</a>' if item else "-"
-        stripe = "odd" if i % 2 == 0 else "even"
-        body += (
-            f'<tr class="{stripe}"><td>{po}</td><td>{link}</td><td>10</td><td>{status}</td></tr>\n'
-        )
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Portal</title>{head_extra}</head>
-<body{body_attr}>
-<div id="app" class="{wrapper}">
-{banner}<h1 class="title">Orders</h1>
-<div class="l1"><div class="l2"><div class="l3"><div class="l4">
-<{leaf} class="leaf">x</{leaf}>
-</div></div></div></div>
-<table id="{table_id}" class="{table_class}">
-<thead><tr><th>PO</th><th>Item</th><th>Qty</th><th>Status</th></tr></thead>
-<tbody>
-{body}{extra_rows}</tbody>
-</table>
-</div>
-</body></html>
-"""
 
 
 def test_baseline_extracts_rows_fields_and_attributes(site: Site, store: Store) -> None:
