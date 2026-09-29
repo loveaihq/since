@@ -118,7 +118,14 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   PO table and portal text as of its last look (like notes it saved), plus raw access to everything now.
 - **D35 (M3) Measurement.** Headless Claude Code with only the arm's MCP server (`--tools ""`,
   `--strict-mcp-config`), a per-run `--max-budget-usd` cap; input tokens include cached input (reported
-  separately too); refs graded after normalisation; duplicates counted once.
+  separately too); refs graded after normalisation; duplicates counted once. Isolation and method (amended after M3 QA): `--setting-sources ""` (no user/project CLAUDE.md or
+  hooks), auto-memory off (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), a one-line neutral `--system-prompt` that
+  states the simulated now (Claude Code's default prompt carries the real date and is much longer, so
+  absolute token numbers are lower than in normal use), `--effort medium`, temp cwd. Reported: model
+  requests (`api_calls`), tool calls, input tokens incl. cache, output tokens, cost; recall against all
+  planted items, against items observable by Since, and against items observable by arm A's tools. Local
+  paths in committed results are replaced by `~` by the harness.
+
 - **D36 (M3) Benchmark spend.** Default 3 runs per arm on Sonnet with a $3 per-run cap; the harness never
   runs more than the requested runs.
 - **D26 revised (M3) imap default `track_fields` is `[folder]`.** The benchmark replay showed that flag and
@@ -128,3 +135,11 @@ Small spec changes/clarifications made by the architect. Direction changes go to
 - **D37 (M3) Benchmark source configs mirror CLAUDE.md's example.** po-table and portal carry
   `highlight: [{field: status, changed_to: Cancelled}]` exactly as in the spec's config example; nothing
   else is keyed to the answer key.
+
+### M3 QA round 1
+- **D32 amended — `since ui` opens the database with SQLite `mode=ro`.** It never creates a home or a
+  database (a missing one shows "no database at <path>") and never migrates an older schema (it says so and
+  asks to run the daemon once). Times on audit pages are shown to the second.
+- **D38 — status shows both the start of an error streak and the latest error.**
+  `error since <streak start>; latest <time>: "<message>"`, because the streak can start with one cause
+  (layout broken) and now have another (login expired).
