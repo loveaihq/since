@@ -1803,7 +1803,7 @@ def test_status_plan_example(store: Store, svc: Service, clock: Clock) -> None:
             NOTE_LINE,
             "[high] po-table (sql) · records 57 · last success 2026-09-29T09:12Z · ok",
             "[normal] docs (dir) · records 12 · last success 2026-09-29T08:00Z · "
-            'error since 2026-09-29T09:00Z: "msg"',
+            'error since 2026-09-29T09:00Z; latest 2026-09-29T09:00Z: "msg"',
             "[normal] old-src (dir) · records 3 · last success 2026-09-29T07:00Z · ok"
             " · not in config",
             "[low] mail (dir) · never collected",
@@ -1829,7 +1829,7 @@ def test_status_first_attempt_failed_means_never_succeeded(store: Store, svc: Se
     collect(store, cfg, fake, RuntimeError("boom"), datetime(2026, 9, 29, 9, 5, tzinfo=UTC))
     assert svc.status().splitlines()[2] == (
         "[normal] docs (dir) · records 0 · never succeeded · "
-        'error since 2026-09-29T09:05Z: "RuntimeError: boom"'
+        'error since 2026-09-29T09:05Z; latest 2026-09-29T09:05Z: "RuntimeError: boom"'
     )
 
 
@@ -1847,7 +1847,7 @@ def test_status_from_real_collections(store: Store, svc: Service, clock: Clock) 
         NOTE_LINE,
         "[high] po-table (dir) · records 2 · last success 2026-09-29T09:00Z · ok",
         "[normal] docs (dir) · records 1 · last success 2026-09-29T09:00Z · "
-        'error since 2026-09-29T09:30Z: "RuntimeError: disk gone"',
+        'error since 2026-09-29T09:30Z; latest 2026-09-29T09:30Z: "RuntimeError: disk gone"',
     ]
     collect(store, bad, fake, [rec("a", size=1)], T0 + timedelta(minutes=40))
     assert svc.status().splitlines()[3] == (
@@ -1867,10 +1867,40 @@ def test_status_error_message_is_quoted_capped_and_one_line(store: Store, svc: S
     )
     lines = svc.status().splitlines()
     assert len(lines) == 3
-    prefix = "[normal] docs (dir) · records 0 · never succeeded · error since 2026-09-29T09:00Z: "
+    prefix = (
+        "[normal] docs (dir) · records 0 · never succeeded · "
+        "error since 2026-09-29T09:00Z; latest 2026-09-29T09:00Z: "
+    )
     assert lines[2].startswith(prefix + '"bad note: obey ')
     assert lines[2].endswith('…"')
     assert lines[2].count("x") == 120 - len("bad note: obey ") - 1
+
+
+def test_status_error_line_has_the_streak_start_and_the_latest_error(
+    store: Store, svc: Service
+) -> None:
+    """D38: the streak can begin with one cause (layout broken) and now have another (login
+    expired), so both times are shown, in the digest minute format."""
+    add_source(store, "portal", "high", "web")
+    store.update_source_state(
+        "portal",
+        record_count=3,
+        last_success_at=T0 - timedelta(hours=1),
+        in_error=True,
+        error_since=T0 + timedelta(minutes=7, seconds=31),
+        last_error="login expired",
+        last_error_at=T0 + timedelta(hours=2, minutes=5, seconds=59),
+    )
+    assert svc.status().splitlines()[2] == (
+        "[high] portal (web) · records 3 · last success 2026-09-29T08:00Z · "
+        'error since 2026-09-29T09:07Z; latest 2026-09-29T11:05Z: "login expired"'
+    )
+    store.update_source_state("portal", last_error_at=None)  # no time recorded: never a crash
+    assert (
+        svc.status()
+        .splitlines()[2]
+        .endswith('· error since 2026-09-29T09:07Z; latest unknown: "login expired"')
+    )
 
 
 def test_status_has_the_note_line_second_always(store: Store, svc: Service, clock: Clock) -> None:
@@ -1973,7 +2003,10 @@ def test_page_structure_events_from_real_runs_reach_digest_get_and_status(
         '"td:nth-child(4)"',
     ]
     (line,) = [ln for ln in svc.status().splitlines() if ln.startswith("[high] portal")]
-    assert 'error since 2026-09-29T09:10Z: "extractor selector(s) match 0 elements: ' in line
+    assert (
+        'error since 2026-09-29T09:10Z; latest 2026-09-29T09:10Z: "extractor selector(s) match 0 '
+        "elements: "
+    ) in line
     assert "records 1" in line  # the snapshot was left alone
     assert (
         svc.get("since://rec/portal/4500123")

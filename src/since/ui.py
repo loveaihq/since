@@ -6,7 +6,8 @@ came from a source or an agent, so it is untrusted: every database-derived value
 ``html.escape(..., quote=True)`` (markup is built with :class:`_Safe`, which makes "escape unless it
 is markup built here" the default), a strict Content-Security-Policy forbids scripts, the ``Host``
 header must name this server (DNS rebinding), and only GET/HEAD are answered. Each request opens
-the store on its own, reads, and closes it; nothing here writes, and nothing calls an LLM.
+the store on its own (SQLite ``mode=ro``: it never creates, writes or migrates a database), reads,
+and closes it; nothing here writes, and nothing calls an LLM.
 """
 
 from __future__ import annotations
@@ -30,8 +31,17 @@ from since.model import AGENT_ID_RE, PRIORITIES, SOURCE_ID_RE, Event
 from since.render import estimate_tokens, event_body, evt_handle
 from since.sanitize import _SCRUB_CATEGORIES, DIGEST_CAP, q
 from since.service import Service
-from since.store import AgentSummary, ServedEntry, SourceState, Store
-from since.timeutil import fmt_age, fmt_minute, from_iso
+from since.store import (
+    SCHEMA_VERSION,
+    AgentSummary,
+    NoDatabaseError,
+    SchemaVersionError,
+    ServedEntry,
+    SourceState,
+    Store,
+    UnreadableEvent,
+)
+from since.timeutil import fmt_age, from_iso, to_iso
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8737
@@ -39,6 +49,7 @@ PAGE_SIZE = 50  # rows per page of /events and /served
 HOME_SERVED = 20  # served responses listed on /
 EVENT_VIEW_BUDGET = 1500  # the default budget of ``get``: /event/<seq> shows what ``get`` shows
 ARG_CAP = 60  # characters of one argument value in an arguments summary
+ERROR_PREFIX = "error: "  # how the service starts a response that reports a failure
 REQUEST_TIMEOUT_S = 15  # a client that stalls mid-request is dropped
 
 _SECURITY_HEADERS = (
@@ -115,14 +126,23 @@ def _line(value: object, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - 1] + "…"
 
 
-def _visible(text: str) -> str:
-    """Control/format characters (newline excepted) written as ``\\uXXXX`` so they can be seen."""
+def _is_invisible(c: str) -> bool:
+    """A character the page cannot show as itself: control, format, line/paragraph separator,
+    private use or surrogate (newline excepted)."""
+    return c != "\n" and unicodedata.category(c) in _SCRUB_CATEGORIES
+
+
+def _visible(text: str, angle: bool = False) -> str:
+    """Invisible characters written out so they can be seen: ``\\uXXXX`` (valid inside JSON), or
+    with ``angle`` ``⟨U+XXXX⟩`` (for text that is not JSON)."""
     out = []
     for c in text:
-        if c != "\n" and unicodedata.category(c) in _SCRUB_CATEGORIES:
-            out.append(f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
-        else:
+        if not _is_invisible(c):
             out.append(c)
+        elif angle:
+            out.append(f"⟨U+{ord(c):04X}⟩")
+        else:
+            out.append(f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}")
     return "".join(out)
 
 
@@ -131,11 +151,11 @@ def _json_view(obj: Any, indent: int | None = 2) -> str:
 
 
 def _time(iso: object, missing: str = "never") -> str:
-    """A stored ISO time as shown in digests (``2026-09-29T09:12Z``)."""
+    """A stored ISO time as shown on audit pages, to the second (``2026-09-29T09:12:05Z``)."""
     if not iso:
         return missing
     try:
-        return fmt_minute(from_iso(str(iso)))
+        return to_iso(from_iso(str(iso)))
     except (ValueError, OverflowError):
         return "unknown"
 
@@ -163,6 +183,8 @@ _CSS = (
     "pre{background:#f6f6f6;border:1px solid #ddd;padding:.6rem;white-space:pre-wrap;"
     "overflow-wrap:anywhere;unicode-bidi:isolate}"
     ".muted{color:#666}.err{color:#a40000;font-weight:600}"
+    ".badge{background:#a40000;color:#fff;border-radius:3px;padding:0 .35rem;font-size:12px;"
+    "font-weight:600}"
     "footer{margin-top:2rem;padding-top:.4rem;border-top:1px solid #ccc;color:#666;font-size:12px}"
 )
 
@@ -230,14 +252,23 @@ def _args_summary(args: object) -> str:
     return " ".join(parts) or "-"
 
 
+def _is_error_response(entry: ServedEntry) -> bool:
+    return entry.text.startswith(ERROR_PREFIX)
+
+
+def _error_badge() -> _Safe:
+    return _tag("span", "error", cls="badge")
+
+
 def _served_rows(entries: Sequence[ServedEntry], detailed: bool) -> list[list[object]]:
     rows: list[list[object]] = []
     for e in entries:
+        tool = _line(e.tool, 32)
         row: list[object] = [
             _a(f"/served/{e.id}", f"#{e.id}"),
             _time(e.at, "unknown"),
             _a(_url("/served", agent=e.agent_id), _line(e.agent_id, 64)),
-            _line(e.tool, 32),
+            _join(tool, " ", _error_badge()) if _is_error_response(e) else tool,
             _args_summary(e.args),
         ]
         if detailed:
@@ -266,7 +297,10 @@ def _heartbeat_text(service: Service, now: datetime) -> tuple[str, bool]:
 
 def _state_cell(state: SourceState) -> _Safe:
     if state.in_error:
-        message = f"error since {_time(state.error_since, 'unknown')}: "
+        message = (  # D38: the streak start and the latest error can have different causes
+            f"error since {_time(state.error_since, 'unknown')}; "
+            f"latest {_time(state.last_error_at, 'unknown')}: "
+        )
         cell = _tag("span", _line(message + q(state.last_error, DIGEST_CAP), 400), cls="err")
     elif state.last_success_at is None and state.last_error_at is None:
         cell = _tag("span", "never collected", cls="muted")
@@ -299,13 +333,14 @@ def _agents_table(agents: Sequence[AgentSummary]) -> _Safe:
         [
             _a(_url("/served", agent=a.agent_id), _line(a.agent_id, 64)),
             str(a.cursor),
+            _time(a.cursor_updated_at),
             _time(a.last_served_at),
             str(a.served_count),
         ]
         for a in agents
     ]
-    headers = ("agent", "cursor", "last served", "responses served")
-    return _table(headers, rows, ("", "num", "nowrap", "num"))
+    headers = ("agent", "cursor", "cursor acked at", "last served", "responses served")
+    return _table(headers, rows, ("", "num", "nowrap", "nowrap", "num"))
 
 
 def _home_page(store: Store, now: datetime) -> str:
@@ -334,8 +369,10 @@ def _home_page(store: Store, now: datetime) -> str:
     )
 
 
-def _event_line(event: Event, key_labels: Mapping[str, str]) -> str:
+def _event_line(event: Event | UnreadableEvent, key_labels: Mapping[str, str]) -> str:
     """The digest line body of an event; one unreadable event must not break the page."""
+    if isinstance(event, UnreadableEvent):  # its JSON columns cannot even be decoded
+        return "? unreadable event"
     try:
         text = event_body(event, key_labels.get(event.source_id, ""), DIGEST_CAP)
     except (ValueError, TypeError, KeyError, AttributeError):
@@ -378,25 +415,40 @@ def _events_page(store: Store, source: str | None, before: int | None) -> str:
 
 
 def _event_page(store: Store, seq: int, now: datetime) -> str:
-    event = store.get_event(seq)
+    event = store.get_event_or_unreadable(seq)
     if event is None:
         raise _HttpError(HTTPStatus.NOT_FOUND)
     handle = evt_handle(seq)
-    # The text ``get`` would return; ``_get_evt`` reads only (``get`` itself writes the served log).
-    try:
-        served_text = Service(store, lambda: now)._get_evt(EvtHandle(seq), EVENT_VIEW_BUDGET)
-    except (ValueError, TypeError, KeyError, AttributeError):  # damaged stored data: still show it
-        served_text = "(this event's stored data cannot be rendered as text)"
-    stored = {
-        "seq": event.seq,
-        "source_id": event.source_id,
-        "kind": event.kind,
-        "record_key": event.record_key,
-        "importance": event.importance,
-        "created_at": event.created_at,
-        "field_changes": [change.to_dict() for change in event.field_changes],
-        "detail": event.detail,
-    }
+    stored: dict[str, Any]
+    if isinstance(event, UnreadableEvent):
+        # The JSON columns cannot be decoded: show the columns as stored, escaped like all data.
+        served_text = "(this event's stored data cannot be decoded)"
+        stored = {
+            "seq": event.seq,
+            "source_id": event.source_id,
+            "kind": event.kind,
+            "record_key": event.record_key,
+            "importance": event.importance,
+            "created_at": event.created_at,
+            "field_changes_json": event.field_changes_json,
+            "detail_json": event.detail_json,
+        }
+    else:
+        # The text ``get`` would return; ``_get_evt`` reads only (``get`` writes the served log).
+        try:
+            served_text = Service(store, lambda: now)._get_evt(EvtHandle(seq), EVENT_VIEW_BUDGET)
+        except (ValueError, TypeError, KeyError, AttributeError):  # damaged data: still show it
+            served_text = "(this event's stored data cannot be rendered as text)"
+        stored = {
+            "seq": event.seq,
+            "source_id": event.source_id,
+            "kind": event.kind,
+            "record_key": event.record_key,
+            "importance": event.importance,
+            "created_at": event.created_at,
+            "field_changes": [change.to_dict() for change in event.field_changes],
+            "detail": event.detail,
+        }
     title = f"Event {seq}"
     return _page(
         title,
@@ -441,29 +493,67 @@ def _served_entry_page(store: Store, served_id: int) -> str:
     entry = store.get_served(served_id)
     if entry is None:
         raise _HttpError(HTTPStatus.NOT_FOUND)
-    facts = _table(
-        ("field", "value"),
-        [
-            ["id", str(entry.id)],
-            ["agent", _a(_url("/served", agent=entry.agent_id), _line(entry.agent_id, 64))],
-            ["tool", _line(entry.tool, 32)],
-            ["arguments", _tag("code", _json_view(entry.args, indent=None))],
-            ["via", _line(entry.via, 16)],
-            ["served at", _time(entry.at, "unknown")],
-            ["size", f"{len(entry.text)} characters, ~{estimate_tokens(entry.text)} tokens"],
-        ],
-    )
+    fact_rows: list[list[object]] = [
+        ["id", str(entry.id)],
+        ["agent", _a(_url("/served", agent=entry.agent_id), _line(entry.agent_id, 64))],
+        ["tool", _line(entry.tool, 32)],
+        ["arguments", _tag("code", _json_view(entry.args, indent=None))],
+        ["via", _line(entry.via, 16)],
+        ["served at", _time(entry.at, "unknown")],
+        ["size", f"{len(entry.text)} characters, ~{estimate_tokens(entry.text)} tokens"],
+    ]
+    if _is_error_response(entry):
+        fact_rows.append(["result", _error_badge()])
+    facts = _table(("field", "value"), fact_rows)
+
+    # The text itself stays exact; when it holds characters a browser would not show as
+    # themselves (or would act on: bidi overrides), a second view spells them out.
+    exact: list[_Safe] = [_pre(entry.text)]
+    invisible = sum(1 for c in entry.text if _is_invisible(c))
+    if invisible:
+        exact.insert(
+            0,
+            _tag(
+                "p",
+                f"contains {invisible} invisible character{'' if invisible == 1 else 's'} "
+                "(shown as ⟨U+XXXX⟩ in the escaped view below)",
+                cls="err",
+            ),
+        )
+        exact += [_tag("h2", "Escaped view"), _pre(_visible(entry.text, angle=True))]
     title = f"Served response #{entry.id}"
     return _page(
         title,
         _tag("h1", title),
         facts,
         _tag("h2", "Exactly what was served"),
-        _pre(entry.text),
+        *exact,
         _links(
             _a(_url("/served", agent=entry.agent_id), f"responses of {_line(entry.agent_id, 64)}"),
             _a("/served", "all served responses"),
         ),
+    )
+
+
+def _unavailable_page(exc: NoDatabaseError | SchemaVersionError) -> str:
+    """The page (HTTP 503) for a database the audit page cannot read as it is."""
+    if isinstance(exc, NoDatabaseError):
+        message = f"no database at {exc.path} — run `since daemon` or `since collect` first"
+    elif exc.older:
+        message = (
+            f"database schema v{exc.found} is older than this Since (v{SCHEMA_VERSION}); "
+            "run the daemon once to migrate"
+        )
+    else:
+        message = (
+            f"database schema v{exc.found} was written by a newer Since "
+            f"(this one understands up to v{SCHEMA_VERSION}); upgrade Since"
+        )
+    return _page(
+        "Since audit page",
+        _tag("h1", "Since audit page"),
+        _tag("p", message, cls="err"),
+        _tag("p", "This page only reads the database; it never creates or migrates.", cls="muted"),
     )
 
 
@@ -514,31 +604,31 @@ def _render(target: str, now: datetime) -> str:
     path, query = parts.path, parts.query
     if path == "/":
         _params(query, ())
-        with Store.open() as store:
+        with Store.open_readonly() as store:
             return _home_page(store, now)
     if path == "/events":
         params = _params(query, ("source", "before"))
         source = _name_param(params, "source", SOURCE_ID_RE)
         before = _id_param(params, "before")
-        with Store.open() as store:
+        with Store.open_readonly() as store:
             return _events_page(store, source, before)
     if path == "/served":
         params = _params(query, ("agent", "before"))
         agent = _name_param(params, "agent", AGENT_ID_RE)
         before = _id_param(params, "before")
-        with Store.open() as store:
+        with Store.open_readonly() as store:
             return _served_page(store, agent, before)
     if (m := _EVENT_PATH.fullmatch(path)) is not None:
         _params(query, ())
         if int(m.group(1)) > MAX_SEQ:
             raise _HttpError(HTTPStatus.NOT_FOUND)
-        with Store.open() as store:
+        with Store.open_readonly() as store:
             return _event_page(store, int(m.group(1)), now)
     if (m := _SERVED_PATH.fullmatch(path)) is not None:
         _params(query, ())
         if int(m.group(1)) > MAX_SEQ:
             raise _HttpError(HTTPStatus.NOT_FOUND)
-        with Store.open() as store:
+        with Store.open_readonly() as store:
             return _served_entry_page(store, int(m.group(1)))
     raise _HttpError(HTTPStatus.NOT_FOUND)
 
@@ -602,6 +692,10 @@ class _Handler(BaseHTTPRequestHandler):
             page = _render(self.path, self.server.now_fn())
         except _HttpError as exc:
             self._text(exc.status, exc.reason)
+            return
+        except (NoDatabaseError, SchemaVersionError) as exc:  # a normal page, saying what to do
+            body = _unavailable_page(exc).encode("utf-8", "replace")
+            self._send(HTTPStatus.SERVICE_UNAVAILABLE, body, "text/html; charset=utf-8")
             return
         except Exception as exc:  # a bug or an unusable database: no details to the client
             _log(f"{self.command} {q(self.path, 120)} failed: {type(exc).__name__}: {q(exc, 200)}")

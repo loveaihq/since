@@ -453,7 +453,11 @@ def _status_line(state: SourceState) -> str:
             parts.append(f"last success {_fmt_time(state.last_success_at)}")
         if state.in_error:
             error = q(state.last_error, DIGEST_CAP)
-            parts.append(f"error since {_fmt_time(state.error_since)}: {error}")
+            # D38: the streak can start with one cause and now have another, so both times.
+            parts.append(
+                f"error since {_fmt_time(state.error_since)}; "
+                f"latest {_fmt_time(state.last_error_at)}: {error}"
+            )
         else:
             parts.append("ok")
     if not state.configured:

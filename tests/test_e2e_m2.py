@@ -417,7 +417,8 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert (run.code, run.out) == (0, login_digest)  # still the one event
         status = since("status")
         portal = only(r"^\[high\] sps-portal \(web\) · records 3 · ", status.lines)
-        assert re.search(r' · error since \S+: "login expired"$', portal.string)
+        # the streak began with the broken layout; the latest error is the expired login (D38)
+        assert re.search(r' · error since \S+; latest \S+: "login expired"$', portal.string)
 
         site.logged_in = True
         run = since("collect", "sps-portal")

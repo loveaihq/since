@@ -147,6 +147,38 @@ class StoreError(Exception):
     """The database cannot be used (e.g. written by a newer version of Since)."""
 
 
+class NoDatabaseError(StoreError):
+    """:meth:`Store.open_readonly` found no database (no file, or a file without Since's tables)."""
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"no database at {path}")
+        self.path = path
+
+
+class SchemaVersionError(StoreError):
+    """:meth:`Store.open_readonly` found a schema version this Since does not open as it is: an
+    older one (only a read-write open migrates it) or a newer one (written by a newer Since)."""
+
+    def __init__(self, path: Path, found: int) -> None:
+        if found < SCHEMA_VERSION:
+            text = (
+                f"{path} has schema version {found}, older than this Since ({SCHEMA_VERSION}); "
+                "a read-write open (the daemon) migrates it"
+            )
+        else:
+            text = (
+                f"{path} has schema version {found}; this Since understands up to "
+                f"{SCHEMA_VERSION}. Upgrade Since."
+            )
+        super().__init__(text)
+        self.path = path
+        self.found = found
+
+    @property
+    def older(self) -> bool:
+        return self.found < SCHEMA_VERSION
+
+
 @dataclass(frozen=True)
 class SourceState:
     """Persistent per-source state. Times are stored ISO strings (or None). ``fingerprint`` and
@@ -171,6 +203,21 @@ class SourceState:
     fingerprint: str | None = None
     broken: list[str] = field(default_factory=list)
     announced_error: str | None = None
+
+
+@dataclass(frozen=True)
+class UnreadableEvent:
+    """An ``events`` row whose JSON columns cannot be decoded (a damaged or tampered database):
+    the columns exactly as stored, so the audit page can still list it and show what is there."""
+
+    seq: int
+    source_id: str
+    kind: str
+    record_key: str | None
+    importance: int
+    field_changes_json: str
+    detail_json: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -244,6 +291,26 @@ def _event_from_row(row: sqlite3.Row) -> Event:
     )
 
 
+# What decoding an events row can raise: invalid JSON, JSON of the wrong shape, absurd nesting.
+_EVENT_DECODE_ERRORS = (ValueError, TypeError, KeyError, AttributeError, RecursionError)
+
+
+def _event_or_unreadable(row: sqlite3.Row) -> Event | UnreadableEvent:
+    try:
+        return _event_from_row(row)
+    except _EVENT_DECODE_ERRORS:
+        return UnreadableEvent(
+            seq=row["seq"],
+            source_id=row["source_id"],
+            kind=row["kind"],
+            record_key=row["record_key"],
+            importance=row["importance"],
+            field_changes_json=row["field_changes_json"],
+            detail_json=row["detail_json"],
+            created_at=row["created_at"],
+        )
+
+
 def _served_from_row(row: sqlite3.Row) -> ServedEntry:
     return ServedEntry(
         id=row["id"],
@@ -254,6 +321,10 @@ def _served_from_row(row: sqlite3.Row) -> ServedEntry:
         via=row["via"],
         at=row["at"],
     )
+
+
+def _decode_lenient(data: bytes) -> str:
+    return data.decode("utf-8", "replace")
 
 
 def _prepare_home(home: Path) -> None:
@@ -306,6 +377,58 @@ class Store:
             conn.close()
             raise
         return store
+
+    @classmethod
+    def open_readonly(cls, home: Path | str | None = None) -> Store:
+        """Open the existing database in ``home`` (default: ``since_home()``) read-only.
+
+        SQLite ``mode=ro``: nothing is written, no directory or file is created, nothing is
+        migrated (the -wal/-shm side files of a WAL database may appear, as for any reader).
+        Raises :class:`NoDatabaseError` if there is no database and :class:`SchemaVersionError`
+        if its schema is older or newer than this Since's. Text that is not valid UTF-8 is read
+        with replacement characters instead of failing the query.
+        """
+        path = db_path() if home is None else Path(home).expanduser() / DB_FILENAME
+        if not path.is_file():
+            raise NoDatabaseError(path)
+        uri = path.absolute().as_uri() + "?mode=ro"
+        try:
+            conn = sqlite3.connect(
+                uri,
+                uri=True,
+                isolation_level=None,
+                timeout=BUSY_TIMEOUT_MS / 1000,
+                check_same_thread=True,
+            )
+        except sqlite3.OperationalError:
+            if not path.is_file():  # removed between the check and the open
+                raise NoDatabaseError(path) from None
+            raise
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.text_factory = _decode_lenient
+            conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA query_only = ON")  # belt and braces next to mode=ro
+            store = cls(conn, path)
+            store._check_readonly_schema()
+        except BaseException:
+            conn.close()
+            raise
+        return store
+
+    def _check_readonly_schema(self) -> None:
+        has_meta = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+        ).fetchone()
+        if has_meta is None:  # an empty file: nothing of Since's is in it
+            raise NoDatabaseError(self.path)
+        value = self.get_meta("schema_version")
+        try:
+            found = 0 if value is None else int(value)
+        except ValueError:
+            raise StoreError(f"{self.path} has an unreadable schema version") from None
+        if found != SCHEMA_VERSION:
+            raise SchemaVersionError(self.path, found)
 
     def close(self) -> None:
         self._conn.close()
@@ -585,11 +708,20 @@ class Store:
         rows = self._conn.execute(sql + " ORDER BY seq", params).fetchall()
         return [_event_from_row(r) for r in rows]
 
+    def get_event_or_unreadable(self, seq: int) -> Event | UnreadableEvent | None:
+        """Like :meth:`get_event`, but a row whose JSON cannot be decoded comes back as an
+        :class:`UnreadableEvent` (its raw columns) instead of raising. For the audit page."""
+        row = self._conn.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM events WHERE seq = ?", (seq,)
+        ).fetchone()
+        return None if row is None else _event_or_unreadable(row)
+
     def list_events(
         self, before: int | None = None, source_id: str | None = None, limit: int = 50
-    ) -> list[Event]:
+    ) -> list[Event | UnreadableEvent]:
         """Newest first (seq descending): events with ``seq < before`` (if given), optionally one
-        source, at most ``limit``. Read-only, for the audit page."""
+        source, at most ``limit``. Read-only, for the audit page: a row that cannot be decoded is
+        listed as an :class:`UnreadableEvent` (one damaged row must not hide the others)."""
         sql = f"SELECT {_EVENT_COLUMNS} FROM events"
         where: list[str] = []
         params: list[Any] = []
@@ -602,7 +734,7 @@ class Store:
         if where:
             sql += " WHERE " + " AND ".join(where)
         rows = self._conn.execute(sql + " ORDER BY seq DESC LIMIT ?", (*params, limit)).fetchall()
-        return [_event_from_row(r) for r in rows]
+        return [_event_or_unreadable(r) for r in rows]
 
     def max_seq(self) -> int:
         """Highest seq ever assigned (0 if none). Read from ``sqlite_sequence`` so it survives

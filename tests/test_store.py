@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import stat
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -23,7 +25,15 @@ from since.model import (
     FieldChange,
     Record,
 )
-from since.store import AgentSummary, SourceState, Store, StoreError
+from since.store import (
+    AgentSummary,
+    NoDatabaseError,
+    SchemaVersionError,
+    SourceState,
+    Store,
+    StoreError,
+    UnreadableEvent,
+)
 
 T0 = datetime(2026, 9, 29, 9, 0, 0, tzinfo=UTC)
 
@@ -417,6 +427,207 @@ def test_posix_permissions(since_home_dir: Path) -> None:
                 assert stat.S_IMODE(side.stat().st_mode) == 0o600
 
 
+# --- open_readonly ---------------------------------------------------------------------------
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_open_readonly_of_a_missing_home_or_file_creates_nothing(since_home_dir: Path) -> None:
+    with pytest.raises(NoDatabaseError) as excinfo:
+        Store.open_readonly()
+    assert excinfo.value.path == since_home_dir / "since.db"
+    assert str(excinfo.value) == f"no database at {since_home_dir / 'since.db'}"
+    assert isinstance(excinfo.value, StoreError)
+    assert not since_home_dir.exists()
+
+    since_home_dir.mkdir()
+    with pytest.raises(NoDatabaseError):
+        Store.open_readonly()
+    assert list(since_home_dir.iterdir()) == []  # no file, no -wal, no -shm
+
+    (since_home_dir / "since.db").mkdir()  # not a file at all
+    with pytest.raises(NoDatabaseError):
+        Store.open_readonly()
+
+
+def test_open_readonly_of_an_empty_file_is_no_database_and_leaves_it_empty(
+    since_home_dir: Path,
+) -> None:
+    since_home_dir.mkdir()
+    path = since_home_dir / "since.db"
+    path.write_bytes(b"")
+    with pytest.raises(NoDatabaseError):
+        Store.open_readonly()
+    sqlite3.connect(path).close()  # a database that has no table (what sqlite3 leaves behind)
+    with pytest.raises(NoDatabaseError):
+        Store.open_readonly()
+    assert path.read_bytes() == b""
+    assert [p.name for p in since_home_dir.iterdir()] == ["since.db"]
+
+
+def test_open_readonly_reads_a_current_database_and_cannot_write(since_home_dir: Path) -> None:
+    with Store.open() as s:
+        add_source(s)
+        s.append_event("docs", KIND_BASELINE, now=at(), detail={"record_count": 1})
+        s.set_cursor("agent", 1, at())
+    path = since_home_dir / "since.db"
+    before = sha256(path)
+
+    with Store.open_readonly() as ro:
+        assert ro.path == path
+        assert ro.get_meta("schema_version") == "3"
+        assert ro.get_cursor("agent") == 1
+        assert [e.seq for e in ro.events_after(0)] == [1]
+        assert ro.max_seq() == 1
+        assert [s.source_id for s in ro.list_source_states()] == ["docs"]
+        for write in (
+            lambda: ro.set_cursor("agent", 5, at()),
+            lambda: ro.append_event("docs", KIND_ADDED, now=at()),
+            lambda: ro.set_meta("k", "v"),
+            lambda: ro.log_served("a", "since", {}, "t", "cli", at()),
+            lambda: raw(ro, "CREATE TABLE evil (x)"),
+        ):
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                write()
+        with pytest.raises(sqlite3.OperationalError):  # a change of the journal mode, too
+            raw(ro, "PRAGMA journal_mode = DELETE")
+    assert sha256(path) == before
+    with Store.open() as s:  # nothing of the refused writes is there
+        assert s.get_cursor("agent") == 1 and s.max_seq() == 1 and s.get_meta("k") is None
+
+
+def test_open_readonly_with_an_explicit_home(tmp_path: Path, since_home_dir: Path) -> None:
+    home = tmp_path / "elsewhere"
+    with Store.open(home) as s:
+        s.set_cursor("agent", 4, at())
+    with Store.open_readonly(home) as ro:
+        assert ro.path == home / "since.db" and ro.get_cursor("agent") == 4
+    with Store.open_readonly(str(home)) as ro:
+        assert ro.get_cursor("agent") == 4
+    with pytest.raises(NoDatabaseError):
+        Store.open_readonly()  # SINCE_HOME has none
+    assert not since_home_dir.exists()
+
+
+def test_open_readonly_handles_uri_special_characters_in_the_path(tmp_path: Path) -> None:
+    home = tmp_path / "a b#c%41d é"  # a space, #, a %41 that must not become an A, non-ASCII
+    with Store.open(home) as s:
+        s.set_cursor("agent", 3, at())
+    with Store.open_readonly(home) as ro:
+        assert ro.get_cursor("agent") == 3
+    assert [p.name for p in home.iterdir() if p.name == "since.db"] == ["since.db"]
+    assert not (tmp_path / "a b#c").exists() and not (tmp_path / "a b").exists()
+
+
+def test_open_readonly_of_a_relative_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with Store.open(tmp_path / "rel") as s:
+        s.set_cursor("agent", 2, at())
+    monkeypatch.chdir(tmp_path)
+    with Store.open_readonly("rel") as ro:
+        assert ro.get_cursor("agent") == 2
+
+
+@pytest.mark.parametrize(("make", "version"), [(make_v1_database, 1), (make_v2_database, 2)])
+def test_open_readonly_of_an_older_schema_refuses_and_does_not_migrate(
+    tmp_path: Path, make: Callable[[Path], Path], version: int
+) -> None:
+    home = tmp_path / f"v{version}"
+    path = make(home)
+    before = sha256(path)
+    with pytest.raises(SchemaVersionError) as excinfo:
+        Store.open_readonly(home)
+    error = excinfo.value
+    assert (error.found, error.older, error.path) == (version, True, path)
+    assert isinstance(error, StoreError)
+    assert f"schema version {version}, older than this Since (3)" in str(error)
+    assert sha256(path) == before  # byte for byte: not migrated, no column added
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as con:
+        stored = con.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        assert stored == (str(version),)
+        assert "announced_error" not in {r[1] for r in con.execute("PRAGMA table_info(sources)")}
+    with Store.open(home) as s:  # what the error asks for: a read-write open migrates it
+        assert s.get_meta("schema_version") == "3"
+    with Store.open_readonly(home) as ro:
+        assert ro.get_source_state("portal") is not None
+
+
+def test_open_readonly_of_a_newer_schema_refuses(since_home_dir: Path) -> None:
+    with Store.open() as s:
+        s.set_meta("schema_version", "99")
+    before = sha256(since_home_dir / "since.db")
+    with pytest.raises(SchemaVersionError) as excinfo:
+        Store.open_readonly()
+    assert (excinfo.value.found, excinfo.value.older) == (99, False)
+    assert "schema version 99; this Since understands up to 3" in str(excinfo.value)
+    assert sha256(since_home_dir / "since.db") == before
+
+
+def test_open_readonly_of_a_database_without_a_schema_version(since_home_dir: Path) -> None:
+    since_home_dir.mkdir()
+    con = sqlite3.connect(since_home_dir / "since.db")
+    try:
+        with con:
+            con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    finally:
+        con.close()
+    with pytest.raises(SchemaVersionError) as excinfo:
+        Store.open_readonly()
+    assert (excinfo.value.found, excinfo.value.older) == (0, True)  # a read-write open completes it
+
+    con = sqlite3.connect(since_home_dir / "since.db")
+    try:
+        with con:
+            con.execute("INSERT INTO meta VALUES ('schema_version', 'three')")
+    finally:
+        con.close()
+    with pytest.raises(StoreError, match="unreadable schema version"):
+        Store.open_readonly()
+
+
+def test_open_readonly_of_a_file_that_is_not_a_database_raises_the_sqlite_error(
+    since_home_dir: Path,
+) -> None:
+    since_home_dir.mkdir()
+    (since_home_dir / "since.db").write_bytes(b"this is not a database" * 100)
+    with pytest.raises(sqlite3.DatabaseError):
+        Store.open_readonly()
+
+
+def test_open_readonly_does_not_take_the_write_lock_and_sees_committed_data(
+    since_home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open() as s:
+        s.set_cursor("agent", 7, at())
+    monkeypatch.setattr(store_mod, "BUSY_TIMEOUT_MS", 200)
+    writer = Store.open()  # the daemon: stays open, in the middle of a write transaction
+    try:
+        writer.set_cursor("agent", 8, at())  # committed (autocommit); its pages are in the WAL
+        writer._conn.execute("BEGIN IMMEDIATE")
+        writer.set_cursor("other", 1, at())  # not committed
+        started = time.monotonic()
+        with Store.open_readonly() as ro:
+            assert ro.get_cursor("agent") == 8  # the WAL is read
+            assert ro.get_cursor("other") == 0  # uncommitted data is not
+            assert ro.get_meta("schema_version") == "3"
+        assert time.monotonic() - started < 1.0
+        writer._conn.execute("ROLLBACK")
+    finally:
+        writer.close()
+
+
+def test_open_readonly_reads_text_that_is_not_utf8_with_replacement_characters(
+    store: Store, since_home_dir: Path
+) -> None:
+    store.log_served("agent", "since", {}, "x", "cli", at())
+    raw(store, "UPDATE served_log SET text = CAST(x'6f6bff6b' AS TEXT)")
+    with pytest.raises(sqlite3.OperationalError, match="UTF-8"):
+        store.list_served()  # the read-write connection fails on it
+    with Store.open_readonly() as ro:
+        assert [e.text for e in ro.list_served()] == ["ok�k"]
+
+
 # --- meta ------------------------------------------------------------------------------------
 
 
@@ -734,6 +945,54 @@ def test_list_events_is_newest_first_with_before_and_source(store: Store) -> Non
     assert store.list_events(source_id="zzz") == []
     newest = store.list_events(limit=1)[0]
     assert newest == store.get_event(5)  # full events, like get_event
+
+
+@pytest.mark.parametrize(
+    ("field_changes_json", "detail_json"),
+    [
+        ("not json", "{}"),
+        ("[]", '{"cut off": '),
+        ('{"a": 1}', "{}"),  # a JSON object where a list of changes belongs
+        ("[1]", "{}"),
+        ('[{"old": 1}]', "{}"),  # a change without its field name
+        ("[" * 100_000, "{}"),  # deeper than the decoder's recursion limit
+    ],
+    ids=["not-json", "cut-off", "object", "number", "no-field", "too-deep"],
+)
+def test_list_events_lists_an_undecodable_row_as_unreadable(
+    store: Store, field_changes_json: str, detail_json: str
+) -> None:
+    good = store.append_event("a", KIND_ADDED, now=at(1), record_key="ok", importance=2)
+    bad = store.append_event("a", KIND_ADDED, now=at(2), record_key="k", importance=7)
+    raw(
+        store,
+        "UPDATE events SET field_changes_json = ?, detail_json = ? WHERE seq = ?",
+        field_changes_json,
+        detail_json,
+        bad,
+    )
+    last = store.append_event("b", KIND_REMOVED, now=at(3), record_key="z")
+
+    events = store.list_events()
+    assert [e.seq for e in events] == [last, bad, good]  # one bad row does not hide the others
+    assert isinstance(events[0], Event) and isinstance(events[2], Event)
+    assert events[1] == UnreadableEvent(
+        seq=bad,
+        source_id="a",
+        kind=KIND_ADDED,
+        record_key="k",
+        importance=7,
+        field_changes_json=field_changes_json,
+        detail_json=detail_json,
+        created_at="2026-09-29T09:02:00Z",
+    )
+    assert store.get_event_or_unreadable(bad) == events[1]
+    assert store.get_event_or_unreadable(good) == store.get_event(good)
+    assert store.get_event_or_unreadable(999) is None
+    assert [e.seq for e in store.list_events(source_id="a")] == [bad, good]
+    assert store.list_events(before=bad, limit=5) == [store.get_event(good)]
+    with pytest.raises((ValueError, TypeError, KeyError, AttributeError, RecursionError)):
+        store.get_event(bad)  # the strict read (what ``get`` uses) still says so
 
 
 def test_max_seq_empty_is_zero(store: Store) -> None:
