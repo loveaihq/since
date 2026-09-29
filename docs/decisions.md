@@ -121,3 +121,10 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   separately too); refs graded after normalisation; duplicates counted once.
 - **D36 (M3) Benchmark spend.** Default 3 runs per arm on Sonnet with a $3 per-run cap; the harness never
   runs more than the requested runs.
+- **D26 revised (M3) imap default `track_fields` is `[folder]`.** The benchmark replay showed that flag and
+  answered changes on old mail (modified, weight 4) outranked every new mail (added, weight 3), pushing all new
+  mail into `omitted:`. For a "what changed" digest a new mail matters more than an old one being flagged;
+  users who want flags tracked set `track_fields` themselves.
+- **D37 (M3) Benchmark source configs mirror CLAUDE.md's example.** po-table and portal carry
+  `highlight: [{field: status, changed_to: Cancelled}]` exactly as in the spec's config example; nothing
+  else is keyed to the answer key.
