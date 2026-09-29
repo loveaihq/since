@@ -23,16 +23,38 @@ class CollectError(Exception):
 
 
 @dataclass(frozen=True)
+class Window:
+    """How far back a source looks (D21): ``field`` names a record field holding an ISO UTC
+    timestamp, ``start`` (ISO UTC string, parseable by ``timeutil.from_iso``) is the oldest
+    moment still covered. A record that is absent from a result and dated before ``start`` has
+    aged out of the window rather than been removed at the source."""
+
+    field: str
+    start: str
+
+
+@dataclass(frozen=True)
 class CollectOutput:
-    """A collection result that also reports keys it could not read this run (D5).
+    """A collection result with extra facts beside the records.
 
     ``unavailable`` lists keys that *exist* but could not be read right now (e.g. a file another
-    program holds open). The runner keeps their last known record: no event, never ``removed``.
-    A key that was never seen before is simply left out until it becomes readable. A key must not
-    appear both in ``records`` and in ``unavailable``."""
+    program holds open; D5). The runner keeps their last known record: no event, never
+    ``removed``. A key that was never seen before is simply left out until it becomes readable.
+    A key must not appear both in ``records`` and in ``unavailable``.
+
+    ``window`` (D21): records of the previous snapshot that are absent from ``records`` and older
+    than ``window.start`` leave the snapshot without a ``removed`` event. A baseline ignores it.
+
+    ``fingerprint`` / ``broken`` (D18, web sources): a structural fingerprint of the page and the
+    extractor selectors that matched nothing. ``None`` fingerprint = the source does not track
+    page structure (``broken`` is then ignored). A non-empty ``broken`` means the extraction is
+    not trustworthy: the runner never diffs such a result."""
 
     records: list[Record]
     unavailable: list[str] = field(default_factory=list)
+    window: Window | None = None
+    fingerprint: str | None = None
+    broken: list[str] = field(default_factory=list)
 
 
 class Collector(Protocol):
@@ -57,9 +79,11 @@ class Collector(Protocol):
         ...
 
     def collect(self, cfg: SourceConfig) -> list[Record] | CollectOutput:
-        """Read the source now. Return the records, or a :class:`CollectOutput` when some keys
-        exist but could not be read (``unavailable``). Raise ``CollectError`` (or anything else)
-        on failure; a failed collection must never be reported as an empty list."""
+        """Read the source now. Return the records, or a :class:`CollectOutput` when there is
+        more to report: keys that exist but could not be read (``unavailable``), a collection
+        ``window``, a page ``fingerprint`` with the ``broken`` selectors. Raise ``CollectError``
+        (or anything else) on failure; a failed collection must never be reported as an empty
+        list."""
         ...
 
 

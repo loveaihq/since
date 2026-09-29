@@ -14,7 +14,7 @@ import sqlite3
 import sys
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -23,7 +23,7 @@ from since.model import KINDS, Event, FieldChange, Record
 from since.paths import db_path
 from since.timeutil import to_iso
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 DB_FILENAME = "since.db"
 
@@ -50,7 +50,9 @@ _SCHEMA = (
         last_error TEXT,
         last_error_at TEXT,
         last_success_at TEXT,
-        record_count INTEGER NOT NULL DEFAULT 0
+        record_count INTEGER NOT NULL DEFAULT 0,
+        fingerprint TEXT,
+        broken_json TEXT NOT NULL DEFAULT '[]'
     )
     """,
     """
@@ -98,11 +100,19 @@ _SCHEMA = (
     """,
 )
 
+# Columns that schema v2 added to ``sources`` (D18): what an opened v1 database is migrated with.
+_V2_SOURCE_COLUMNS = (
+    ("fingerprint", "TEXT"),
+    ("broken_json", "TEXT NOT NULL DEFAULT '[]'"),
+)
+
 _SOURCE_COLUMNS = (
     "source_id, type, priority, schedule_s, key_label, configured, baselined, in_error, "
-    "error_since, last_error, last_error_at, last_success_at, record_count"
+    "error_since, last_error, last_error_at, last_success_at, record_count, fingerprint, "
+    "broken_json"
 )
-# Columns update_source_state may set (everything except the primary key).
+# Columns update_source_state may set (everything except the primary key). ``broken`` is a list
+# of str, stored as JSON in the ``broken_json`` column.
 _UPDATABLE_COLUMNS = frozenset(
     {
         "type",
@@ -117,6 +127,8 @@ _UPDATABLE_COLUMNS = frozenset(
         "last_error_at",
         "last_success_at",
         "record_count",
+        "fingerprint",
+        "broken",
     }
 )
 _BOOL_COLUMNS = frozenset({"configured", "baselined", "in_error"})
@@ -132,7 +144,9 @@ class StoreError(Exception):
 
 @dataclass(frozen=True)
 class SourceState:
-    """Persistent per-source state. Times are stored ISO strings (or None)."""
+    """Persistent per-source state. Times are stored ISO strings (or None). ``fingerprint`` and
+    ``broken`` are the page structure last seen by a source that tracks it (D18): the structural
+    fingerprint and the sorted extractor selectors that matched nothing."""
 
     source_id: str
     type: str
@@ -147,6 +161,8 @@ class SourceState:
     last_error_at: str | None
     last_success_at: str | None
     record_count: int
+    fingerprint: str | None = None
+    broken: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -189,6 +205,8 @@ def _state_from_row(row: sqlite3.Row) -> SourceState:
         last_error_at=row["last_error_at"],
         last_success_at=row["last_success_at"],
         record_count=row["record_count"],
+        fingerprint=row["fingerprint"],
+        broken=json.loads(row["broken_json"]),
     )
 
 
@@ -275,19 +293,32 @@ class Store:
             return False
 
     def _init_schema(self) -> None:
+        """Create what is missing and migrate an older database, all in one write transaction.
+        Skipped entirely (no write lock) when the database is already at the current version."""
         if self._schema_is_current():
             return
         with self.transaction():
             for stmt in _SCHEMA:
                 self._conn.execute(stmt)
             current = self.get_meta("schema_version")
-            if current is None:
-                self.set_meta("schema_version", str(SCHEMA_VERSION))
-            elif int(current) > SCHEMA_VERSION:
+            version = 0 if current is None else int(current)
+            if version > SCHEMA_VERSION:
                 raise StoreError(
                     f"{self.path} has schema version {current}; this Since understands "
                     f"up to {SCHEMA_VERSION}. Upgrade Since."
                 )
+            if version < SCHEMA_VERSION:
+                self._add_missing_source_columns()
+                self.set_meta("schema_version", str(SCHEMA_VERSION))
+
+    def _add_missing_source_columns(self) -> None:
+        """v1 -> v2: ``ALTER TABLE sources ADD COLUMN`` for each v2 column the table lacks. A
+        table just created from the current DDL already has them; checking the actual columns
+        (not just the version) also makes a repeated or concurrent migration harmless."""
+        have = {row["name"] for row in self._conn.execute("PRAGMA table_info(sources)")}
+        for name, ddl in _V2_SOURCE_COLUMNS:
+            if name not in have:
+                self._conn.execute(f"ALTER TABLE sources ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -367,21 +398,27 @@ class Store:
 
     def update_source_state(self, source_id: str, **cols: Any) -> None:
         """Set columns of an existing source. Bool columns accept bools; ``datetime`` values are
-        converted to ISO strings. Unknown column -> ``ValueError``; unknown source ->
-        ``KeyError``."""
+        converted to ISO strings; ``broken`` takes a list of str (stored as JSON). Unknown column
+        -> ``ValueError``; unknown source -> ``KeyError``."""
         if not cols:
             return
         unknown = set(cols) - _UPDATABLE_COLUMNS
         if unknown:
             raise ValueError(f"unknown source state column(s): {', '.join(sorted(unknown))}")
         values: list[Any] = []
+        columns: list[str] = []
         for name, value in cols.items():
+            column = name
             if name in _BOOL_COLUMNS:
                 value = int(bool(value))
+            elif name == "broken":
+                column = "broken_json"
+                value = _dumps(list(value))
             elif isinstance(value, datetime):
                 value = to_iso(value)
+            columns.append(column)
             values.append(value)
-        assignments = ", ".join(f"{name} = ?" for name in cols)  # names are whitelisted above
+        assignments = ", ".join(f"{column} = ?" for column in columns)  # whitelisted above
         cur = self._conn.execute(
             f"UPDATE sources SET {assignments} WHERE source_id = ?", (*values, source_id)
         )

@@ -33,6 +33,7 @@ from since.model import (
 )
 from since.render import NOTE_LINE, estimate_tokens
 from since.service import Service
+from since.sources import CollectOutput
 from since.store import Store
 from since.timeutil import to_iso
 
@@ -833,6 +834,25 @@ def test_get_evt_schema_changed_lists_selectors_one_per_line(store: Store, svc: 
         '"table#orders tbody tr"',
         '"td[class=\\"x\\"]"',
     ]
+
+
+def test_get_evt_schema_changed_without_selectors_is_a_layout_change(
+    store: Store, svc: Service
+) -> None:
+    add_source(store, "sps-portal", "high", "web")
+    layout = ["page layout changed; extractor selectors still match"]
+    with_empty_list = add_event(
+        store, "sps-portal", KIND_SCHEMA_CHANGED, detail={"selectors": []}, importance=15
+    )
+    without_detail = add_event(store, "sps-portal", KIND_SCHEMA_CHANGED, importance=15)
+
+    assert svc.get(f"since://evt/{with_empty_list}").splitlines() == [
+        f"since://evt/{with_empty_list} · sps-portal · schema_changed · importance 15 · "
+        "2026-09-29T09:12Z",
+        NOTE_LINE,
+        *layout,
+    ]
+    assert svc.get(f"since://evt/{without_detail}").splitlines()[2:] == layout
 
 
 def test_get_evt_of_a_source_without_state_has_no_key_label(store: Store, svc: Service) -> None:
@@ -1810,6 +1830,51 @@ def test_status_uses_the_same_heartbeat_judgement_as_since(
 # =============================================================================================
 # end to end through real collections
 # =============================================================================================
+
+
+def test_page_structure_events_from_real_runs_reach_digest_get_and_status(
+    store: Store, svc: Service, clock: Clock
+) -> None:
+    cfg = make_cfg("portal", "high")
+    fake = FakeCollector(label="po")
+    row = rec("4500123", status="Open")
+
+    def page(fingerprint: str, broken: list[str] | None = None, rows: list[Record] | None = None):
+        return CollectOutput([row] if rows is None else rows, [], None, fingerprint, broken or [])
+
+    collect(store, cfg, fake, page("f1"), T0)  # 1 baseline
+    collect(store, cfg, fake, page("f2"), T0 + timedelta(minutes=5))  # 2 layout-only change
+    collect(  # 3 selector matches nothing: no rows, no removed
+        store, cfg, fake, page("f3", ["td:nth-child(4)"], rows=[]), T0 + timedelta(minutes=10)
+    )
+    clock.now = T0 + timedelta(minutes=11)
+    beat(store, clock, age_s=5)
+
+    digest = svc.since()
+
+    assert digest.splitlines()[2:] == [
+        "[high] portal (3)",
+        "  ! schema_changed: page layout changed; extractor selectors still match  since://evt/2",
+        '  ! schema_changed: 1 extractor selector matches 0 rows ("td:nth-child(4)")'
+        "  since://evt/3",
+        "  = baseline: 1 record  since://evt/1",
+        "after handling: ack(cursor=3)",
+    ]
+    assert svc.get("since://evt/2").splitlines()[2:] == [
+        "page layout changed; extractor selectors still match"
+    ]
+    assert svc.get("since://evt/3").splitlines()[2:] == [
+        "selectors matching 0 rows:",
+        '"td:nth-child(4)"',
+    ]
+    (line,) = [ln for ln in svc.status().splitlines() if ln.startswith("[high] portal")]
+    assert 'error since 2026-09-29T09:10Z: "extractor selector(s) match 0 elements: ' in line
+    assert "records 1" in line  # the snapshot was left alone
+    assert (
+        svc.get("since://rec/portal/4500123")
+        .splitlines()[0]
+        .endswith("portal · present · updated 2026-09-29T09:00Z")
+    )
 
 
 def test_flow_collect_digest_get_ack(store: Store, svc: Service, clock: Clock) -> None:

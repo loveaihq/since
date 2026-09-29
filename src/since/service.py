@@ -32,6 +32,7 @@ from since.model import (
     FieldChange,
 )
 from since.render import (
+    LAYOUT_CHANGED_TEXT,
     NOTE_LINE,
     batch_handle,
     change_text,
@@ -180,7 +181,10 @@ def _event_lines(event: Event, key_label: str) -> list[str]:
         since = _fmt_time(detail.get("error_since"))
         return [f"recovered; error since {since}: {q(detail.get('last_error'), GET_CAP)}"]
     if kind == KIND_SCHEMA_CHANGED:
-        return ["selectors matching 0 rows:", *(q(s, GET_CAP) for s in _selectors(event))]
+        selectors = _selectors(event)
+        if not selectors:
+            return [LAYOUT_CHANGED_TEXT]
+        return ["selectors matching 0 rows:", *(q(s, GET_CAP) for s in selectors)]
     return []
 
 

@@ -480,6 +480,41 @@ def sources_k() -> dict[str, SourceState]:
     return states(src("inbox", "normal", "", "imap"), src("po-table", "high", "po_no", "sql"))
 
 
+def events_l() -> list[Event]:
+    """schema_changed in its three shapes (D18): layout-only (no selectors), one selector that
+    matches nothing, several. The layout-only one is followed by an ordinary record event."""
+    return [
+        ev(601, "sps-portal", KIND_SCHEMA_CHANGED, detail={"selectors": []}, importance=15),
+        ev(
+            602,
+            "sps-portal",
+            KIND_MODIFIED,
+            "4500123",
+            [fc("status", "Open", "Cancelled")],
+            importance=22,
+        ),
+        ev(
+            603,
+            "supplier-site",
+            KIND_SCHEMA_CHANGED,
+            detail={"selectors": ["table#orders tbody tr"]},
+            importance=10,
+        ),
+        ev(
+            604,
+            "supplier-site",
+            KIND_SCHEMA_CHANGED,
+            detail={"selectors": ["table#orders tbody tr", "td.status"]},
+            importance=10,
+        ),
+        ev(605, "supplier-site", KIND_SCHEMA_CHANGED, importance=10),  # no detail at all
+    ]
+
+
+def sources_l() -> dict[str, SourceState]:
+    return states(src("sps-portal", "high", "po", "web"), src("supplier-site", "normal", "", "web"))
+
+
 GOLDEN_CASES = {
     "a_example": lambda: render_digest("default", 40, events_a(), sources_a(), 800),
     "b_omitted": lambda: render_digest("default", 1000, events_b(), sources_b(), 400),
@@ -507,6 +542,7 @@ GOLDEN_CASES = {
     "h_kinds": lambda: render_digest("default", 200, events_h(), sources_h(), 2000),
     "i_recovered": lambda: render_digest("default", 399, events_i(), sources_a(), 800),
     "k_titles": lambda: render_digest("default", 500, events_k(), sources_k(), 2000),
+    "l_layout": lambda: render_digest("default", 600, events_l(), sources_l(), 2000),
     "j_retention_gap": lambda: render_digest(
         "sleeper",
         5,
@@ -1062,6 +1098,13 @@ def test_body_other_kinds() -> None:
     )
     two = ev(1, "d", KIND_SCHEMA_CHANGED, detail={"selectors": ["a", "b"]})
     assert body(two) == '! schema_changed: 2 extractor selectors match 0 rows ("a", "b")'
+
+
+def test_body_schema_changed_without_selectors_is_a_layout_change() -> None:
+    layout = "! schema_changed: page layout changed; extractor selectors still match"
+    assert body(ev(1, "d", KIND_SCHEMA_CHANGED, detail={"selectors": []})) == layout
+    assert body(ev(1, "d", KIND_SCHEMA_CHANGED)) == layout  # no selectors key at all
+    assert body(ev(1, "d", KIND_SCHEMA_CHANGED, detail={"selectors": "td"})) == layout  # malformed
 
 
 def test_body_caps_values_at_cap() -> None:

@@ -26,6 +26,10 @@ MAX_CHANGES_SHOWN = 3
 # Cap for record-title values in digest and batch lines; `get` views use GET_CAP instead.
 TITLE_CAP = 80
 
+# What a schema_changed event with no selectors says (D18): the page structure changed while
+# every extractor selector still matches.
+LAYOUT_CHANGED_TEXT = "page layout changed; extractor selectors still match"
+
 # --- handles ---------------------------------------------------------------------------------
 
 
@@ -161,5 +165,5 @@ def event_body(event: Event, key_label: str, cap: int) -> str:
             return f"! schema_changed: 1 extractor selector matches 0 rows ({quoted})"
         if selectors:
             return f"! schema_changed: {len(selectors)} extractor selectors match 0 rows ({quoted})"
-        return "! schema_changed"
+        return f"! schema_changed: {LAYOUT_CHANGED_TEXT}"
     return f"? {q(kind, cap)}"

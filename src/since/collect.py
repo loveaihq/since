@@ -8,6 +8,10 @@ Nothing here calls an LLM or reads the clock (``now`` is a parameter).
 
 A run whose ``now`` is older than the last attempt already stored for the source is *stale* (a newer
 run committed while this one was collecting): it is discarded, see ``CollectResult.superseded``.
+
+Two facts a collector can report beside its records (see ``CollectOutput``): a collection
+``window`` (records that aged out of it leave the snapshot without a ``removed`` event, D21) and
+the page structure of a web source (``fingerprint`` / ``broken``, D18).
 """
 
 from __future__ import annotations
@@ -24,13 +28,21 @@ from since.importance import score
 from since.model import (
     KIND_BASELINE,
     KIND_REMOVED,
+    KIND_SCHEMA_CHANGED,
     KIND_SOURCE_ERROR,
     KIND_SOURCE_RECOVERED,
     Record,
     Scalar,
 )
 from since.sanitize import q
-from since.sources import CollectError, Collector, CollectOutput, get_collector, title_fields_for
+from since.sources import (
+    CollectError,
+    Collector,
+    CollectOutput,
+    Window,
+    get_collector,
+    title_fields_for,
+)
 from since.store import SourceState, Store
 from since.timeutil import from_iso
 
@@ -170,13 +182,72 @@ def _check_unavailable(raw: Iterable[str], record_keys: set[str]) -> list[str]:
     return keys
 
 
-def _check_output(raw: Iterable[Record] | CollectOutput) -> tuple[list[Record], list[str]]:
-    """Normalise what ``collect()`` returned (a record list or a ``CollectOutput``) into checked
-    ``(records, unavailable_keys)``."""
+class _Window(NamedTuple):
+    """A validated ``Window``: the field name and the parsed start."""
+
+    field: str
+    start: datetime
+
+
+@dataclass(frozen=True)
+class _Checked:
+    """A validated collector result."""
+
+    records: list[Record]
+    unavailable: list[str] = field(default_factory=list)
+    window: _Window | None = None
+    fingerprint: str | None = None
+    broken: list[str] = field(default_factory=list)
+
+
+def _check_window(raw: object) -> _Window | None:
+    """Validate ``CollectOutput.window``: ``None`` or a ``Window`` with a non-empty str field and
+    a ``start`` that ``timeutil.from_iso`` parses (so it carries a timezone)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, Window):
+        raise CollectError(f"invalid window: {type(raw).__name__}, expected Window")
+    if not isinstance(raw.field, str) or not raw.field:
+        raise CollectError("invalid window: field must be a non-empty string")
+    if not isinstance(raw.start, str):
+        raise CollectError("invalid window: start must be an ISO timestamp string")
+    try:
+        start = from_iso(raw.start)
+    except (ValueError, OverflowError):
+        raise CollectError(
+            f"invalid window: start {q(raw.start, 64)} is not an ISO timestamp with a timezone"
+        ) from None
+    return _Window(raw.field, start)
+
+
+def _check_fingerprint(raw: object) -> str | None:
+    if raw is None or (isinstance(raw, str) and raw):
+        return raw
+    raise CollectError("invalid fingerprint: must be None or a non-empty string")
+
+
+def _check_broken(raw: object) -> list[str]:
+    if not isinstance(raw, (list, tuple)):
+        raise CollectError(f"invalid broken: {type(raw).__name__}, expected a list of strings")
+    for item in raw:
+        if not isinstance(item, str):
+            raise CollectError(f"invalid broken entry of type {type(item).__name__}: not a string")
+    return list(raw)
+
+
+def _check_output(raw: Iterable[Record] | CollectOutput) -> _Checked:
+    """Normalise what ``collect()`` returned (a record list or a ``CollectOutput``) into a
+    checked :class:`_Checked`. Raises ``CollectError`` on the first problem."""
     if isinstance(raw, CollectOutput):
         records = _check_records(raw.records)
-        return records, _check_unavailable(raw.unavailable, {r.key for r in records})
-    return _check_records(raw), []
+        return _Checked(
+            records,
+            _check_unavailable(raw.unavailable, {r.key for r in records}),
+            _check_window(raw.window),
+            _check_fingerprint(raw.fingerprint),
+            _check_broken(raw.broken),
+        )
+    return _Checked(_check_records(raw))
 
 
 def _cap(message: str) -> str:
@@ -223,17 +294,22 @@ def run_collection(
     never ``removed`` events. Otherwise: ``source_recovered`` (if the source was in error), then
     either the one ``baseline`` event (first success) or the diff against the snapshot. Keys the
     collector reports as ``unavailable`` (D5) keep their last known record: unchanged, never
-    removed; never-seen ones are left out. Errors raised by the store itself are not source
+    removed; never-seen ones are left out. Records that aged out of the collector's ``window``
+    (D21) leave the snapshot without an event. Errors raised by the store itself are not source
     failures; they propagate after the rollback.
+
+    A collector that reports a page ``fingerprint`` (D18) also gets page-structure tracking: an
+    extraction whose selectors match nothing (``broken``) is never diffed (see
+    ``_store_success``), and a change of the fingerprint is reported as ``schema_changed``.
 
     If the stored state shows an attempt later than ``now`` (a newer run already committed), the
     result is dropped and ``CollectResult(superseded=True)`` returned (D15)."""
     try:
         title_fields = title_fields_for(cfg, collector)
-        records, unavailable = _check_output(collector.collect(cfg))
+        checked = _check_output(collector.collect(cfg))
     except Exception as exc:
         return _store_failure(store, cfg, collector, now, _failure_message(exc))
-    return _store_success(store, cfg, collector, now, records, unavailable, title_fields)
+    return _store_success(store, cfg, collector, now, checked, title_fields)
 
 
 def _superseded(state: SourceState, now: datetime) -> bool:
@@ -254,25 +330,78 @@ def _superseded(state: SourceState, now: datetime) -> bool:
 def _store_failure(
     store: Store, cfg: SourceConfig, collector: Collector, now: datetime, message: str
 ) -> CollectResult:
-    seqs: list[int] = []
     with store.transaction():
         state = _ensure_state(store, cfg, collector)
         if _superseded(state, now):
             return CollectResult(superseded=True)
-        cols: dict[str, object] = {"last_error": message, "last_error_at": now}
-        if not state.in_error:
-            seqs.append(
-                store.append_event(
-                    cfg.id,
-                    KIND_SOURCE_ERROR,
-                    now=now,
-                    importance=_source_importance(cfg, KIND_SOURCE_ERROR),
-                    detail={"error": message},
-                )
+        return _apply_failure(store, cfg, state, now, message)
+
+
+def _apply_failure(
+    store: Store, cfg: SourceConfig, state: SourceState, now: datetime, message: str
+) -> CollectResult:
+    """Record a failed run (inside the run's transaction, after the staleness check): one
+    ``source_error`` if the source was not in error yet, and always the latest message/time."""
+    seqs: list[int] = []
+    cols: dict[str, object] = {"last_error": message, "last_error_at": now}
+    if not state.in_error:
+        seqs.append(
+            store.append_event(
+                cfg.id,
+                KIND_SOURCE_ERROR,
+                now=now,
+                importance=_source_importance(cfg, KIND_SOURCE_ERROR),
+                detail={"error": message},
             )
-            cols["in_error"] = True
-            cols["error_since"] = now
-        store.update_source_state(cfg.id, **cols)
+        )
+        cols["in_error"] = True
+        cols["error_since"] = now
+    store.update_source_state(cfg.id, **cols)
+    return CollectResult(seqs, message)
+
+
+def _broken_message(broken: list[str]) -> str:
+    """The failure message of an extraction whose selectors matched nothing (D18)."""
+    quoted = ", ".join(q(selector, 120) for selector in broken)
+    return _cap(f"extractor selector(s) match 0 elements: {quoted}")
+
+
+def _apply_broken(
+    store: Store,
+    cfg: SourceConfig,
+    state: SourceState,
+    now: datetime,
+    checked: _Checked,
+    message: str,
+) -> CollectResult:
+    """A baselined source whose extractor selectors matched nothing (D18). The result is not
+    trusted: no diff, snapshot and record count untouched, so a layout change never produces a
+    wave of ``removed``. The source goes (or stays) in error with ``message``; the first
+    ``schema_changed`` event comes instead of a ``source_error``, and another one only when the
+    ``(fingerprint, sorted broken)`` pair differs from the stored one, so a lasting broken state
+    is announced once."""
+    seqs: list[int] = []
+    pair = sorted(checked.broken)
+    cols: dict[str, object] = {
+        "last_error": message,
+        "last_error_at": now,
+        "fingerprint": checked.fingerprint,
+        "broken": pair,
+    }
+    if (checked.fingerprint, pair) != (state.fingerprint, state.broken):
+        seqs.append(
+            store.append_event(
+                cfg.id,
+                KIND_SCHEMA_CHANGED,
+                now=now,
+                importance=_source_importance(cfg, KIND_SCHEMA_CHANGED),
+                detail={"selectors": list(checked.broken)},
+            )
+        )
+    if not state.in_error:
+        cols["in_error"] = True
+        cols["error_since"] = now
+    store.update_source_state(cfg.id, **cols)
     return CollectResult(seqs, message)
 
 
@@ -281,15 +410,27 @@ def _store_success(
     cfg: SourceConfig,
     collector: Collector,
     now: datetime,
-    records: list[Record],
-    unavailable: list[str],
+    checked: _Checked,
     title_fields: list[str],
 ) -> CollectResult:
+    """Store a valid result. With a page fingerprint (D18):
+
+    - broken selectors, not baselined yet: a run failure (a source that never worked must not
+      baseline an empty page);
+    - broken selectors, baselined: :func:`_apply_broken`;
+    - no broken selectors: the fingerprint is stored (with ``broken`` cleared); if the stored
+      one differed, a ``schema_changed`` with no selectors precedes the normal diff."""
     seqs: list[int] = []
+    fingerprint = checked.fingerprint
     with store.transaction():
         state = _ensure_state(store, cfg, collector)
         if _superseded(state, now):
             return CollectResult(superseded=True)
+        if fingerprint is not None and checked.broken:
+            message = _broken_message(checked.broken)
+            if not state.baselined:
+                return _apply_failure(store, cfg, state, now, message)
+            return _apply_broken(store, cfg, state, now, checked, message)
         cols: dict[str, object] = {"last_success_at": now}
         if state.in_error:
             seqs.append(
@@ -303,21 +444,39 @@ def _store_success(
             )
             cols["in_error"] = False
             cols["error_since"] = None
+        if fingerprint is not None:
+            cols["fingerprint"] = fingerprint
+            cols["broken"] = []
         if not state.baselined:
-            store.put_records(cfg.id, records, now)
+            store.put_records(cfg.id, checked.records, now)
             seqs.append(
                 store.append_event(
                     cfg.id,
                     KIND_BASELINE,
                     now=now,
                     importance=_source_importance(cfg, KIND_BASELINE),
-                    detail={"record_count": len(records)},
+                    detail={"record_count": len(checked.records)},
                 )
             )
             cols["baselined"] = True
-            cols["record_count"] = len(records)  # unavailable keys are left out of a baseline
+            # unavailable keys are left out of a baseline; the window is ignored by it
+            cols["record_count"] = len(checked.records)
         else:
-            diff_seqs, count = _store_diff(store, cfg, now, records, unavailable, title_fields)
+            if (
+                fingerprint is not None
+                and state.fingerprint is not None
+                and state.fingerprint != fingerprint
+            ):
+                seqs.append(
+                    store.append_event(
+                        cfg.id,
+                        KIND_SCHEMA_CHANGED,
+                        now=now,
+                        importance=_source_importance(cfg, KIND_SCHEMA_CHANGED),
+                        detail={"selectors": []},
+                    )
+                )
+            diff_seqs, count = _store_diff(store, cfg, now, checked, title_fields)
             seqs.extend(diff_seqs)
             cols["record_count"] = count
         store.update_source_state(cfg.id, **cols)
@@ -336,12 +495,36 @@ def _short(value: Scalar) -> Scalar:
     return value[:200] if isinstance(value, str) else value
 
 
+def _aged_out(
+    comparable: Mapping[str, Record], present: set[str], window: _Window | None
+) -> set[str]:
+    """Keys of ``comparable`` (the old records that take part in the diff) that are absent from
+    the new result (``present``) and dated before the window start (D21). The dates are compared
+    as parsed datetimes. A missing, non-str or unparseable value never ages a record out: it
+    stays an ordinary removal."""
+    if window is None:
+        return set()
+    aged: set[str] = set()
+    for key, record in comparable.items():
+        if key in present:
+            continue
+        value = record.fields.get(window.field)
+        if not isinstance(value, str):
+            continue
+        try:
+            dated = from_iso(value)
+        except (ValueError, OverflowError):
+            continue
+        if dated < window.start:
+            aged.add(key)
+    return aged
+
+
 def _store_diff(
     store: Store,
     cfg: SourceConfig,
     now: datetime,
-    records: list[Record],
-    unavailable: list[str],
+    checked: _Checked,
     title_fields: list[str],
 ) -> tuple[list[int], int]:
     """Diff against the stored snapshot, append the events and bring the snapshot up to date.
@@ -352,10 +535,17 @@ def _store_diff(
 
     Unavailable keys that are in the snapshot are carried forward: hidden from the diff (so they
     are neither modified nor removed) and their snapshot rows left untouched. Unavailable keys
-    that are not in the snapshot are ignored."""
+    that are not in the snapshot are ignored (and are therefore never aged out either).
+
+    Old records that are absent from the result and older than the collector's window have aged
+    out (D21): dropped from the snapshot (``mark_removed``) without an event, and not counted."""
+    records = checked.records
     old = store.get_snapshot(cfg.id)
-    carried = {key for key in unavailable if key in old}
+    carried = {key for key in checked.unavailable if key in old}
     comparable = {key: rec for key, rec in old.items() if key not in carried} if carried else old
+    aged = _aged_out(comparable, {r.key for r in records}, checked.window)
+    if aged:
+        comparable = {key: rec for key, rec in comparable.items() if key not in aged}
     drafts = diff(comparable, records, cfg.track_fields)
     seqs = [
         store.append_event(
@@ -375,6 +565,7 @@ def _store_diff(
     if changed:
         store.put_records(cfg.id, changed, now)
     removed = [d.key for d in drafts if d.kind == KIND_REMOVED]
+    removed.extend(sorted(aged))
     if removed:
         store.mark_removed(cfg.id, removed, now)
     return seqs, len(records) + len(carried)

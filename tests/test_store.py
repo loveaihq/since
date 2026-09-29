@@ -66,7 +66,7 @@ def test_open_creates_home_and_wal_db(since_home_dir: Path) -> None:
     try:
         assert (since_home_dir / "since.db").is_file()
         assert s.path == since_home_dir / "since.db"
-        assert s.get_meta("schema_version") == "1"
+        assert s.get_meta("schema_version") == "2"
     finally:
         s.close()
     # journal_mode is persistent in the db file: a fresh connection sees wal.
@@ -96,7 +96,7 @@ def test_reopen_keeps_data(since_home_dir: Path) -> None:
         assert list(s.get_snapshot("docs")) == ["a"]
         assert s.max_seq() == 1
         assert s.get_cursor("agent") == 1
-        assert s.get_meta("schema_version") == "1"
+        assert s.get_meta("schema_version") == "2"
 
 
 def test_newer_schema_version_is_refused(since_home_dir: Path) -> None:
@@ -119,7 +119,7 @@ def test_open_of_an_existing_database_does_not_take_the_write_lock(
         started = time.monotonic()
         with Store.open() as reader:  # a read-only command (digest, status, mcp) must not wait
             assert reader.get_cursor("agent") == 7
-            assert reader.get_meta("schema_version") == "1"
+            assert reader.get_meta("schema_version") == "2"
         assert time.monotonic() - started < 1.0
 
         # control: with the schema check forced onto the write path the open does block
@@ -136,7 +136,7 @@ def test_open_of_an_empty_database_file_creates_the_schema(since_home_dir: Path)
     sqlite3.connect(since_home_dir / "since.db").close()  # a file without any table
 
     with Store.open() as s:
-        assert s.get_meta("schema_version") == "1"
+        assert s.get_meta("schema_version") == "2"
         assert s.get_cursor("agent") == 0
         assert s.events_after(0) == []
 
@@ -154,9 +154,187 @@ def test_open_completes_a_database_that_has_meta_but_no_schema_version(
         con.close()
 
     with Store.open() as s:
-        assert s.get_meta("schema_version") == "1"
+        assert s.get_meta("schema_version") == "2"
         assert s.get_meta("daemon_pid") == "5"  # existing meta is kept
         assert s.list_source_states() == []  # the rest of the schema now exists
+
+
+# --- schema v1 -> v2 -------------------------------------------------------------------------
+
+# The v1 tables, as the v1 code created them: what a database written before page-structure
+# tracking (D18) contains.
+V1_SCHEMA = (
+    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)",
+    """
+    CREATE TABLE sources (
+        source_id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        schedule_s INTEGER NOT NULL,
+        key_label TEXT NOT NULL DEFAULT '',
+        configured INTEGER NOT NULL DEFAULT 1,
+        baselined INTEGER NOT NULL DEFAULT 0,
+        in_error INTEGER NOT NULL DEFAULT 0,
+        error_since TEXT,
+        last_error TEXT,
+        last_error_at TEXT,
+        last_success_at TEXT,
+        record_count INTEGER NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE TABLE records (
+        source_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        fields_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        present INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (source_id, key)
+    )
+    """,
+    """
+    CREATE TABLE events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        record_key TEXT,
+        field_changes_json TEXT NOT NULL,
+        importance INTEGER NOT NULL,
+        detail_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX idx_events_source_seq ON events (source_id, seq)",
+    "CREATE INDEX idx_events_created_at ON events (created_at)",
+    "CREATE TABLE cursors (agent_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, "
+    "updated_at TEXT NOT NULL)",
+    """
+    CREATE TABLE served_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        tool TEXT NOT NULL,
+        args_json TEXT NOT NULL,
+        text TEXT NOT NULL,
+        via TEXT NOT NULL,
+        at TEXT NOT NULL
+    )
+    """,
+)
+
+
+def make_v1_database(home: Path) -> Path:
+    """A real v1 database file in ``home`` with one source, record, event and cursor."""
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "since.db"
+    con = sqlite3.connect(path, isolation_level=None)
+    try:
+        con.execute("PRAGMA journal_mode = WAL")
+        for stmt in V1_SCHEMA:
+            con.execute(stmt)
+        con.execute("INSERT INTO meta VALUES ('schema_version', '1')")
+        con.execute("INSERT INTO meta VALUES ('daemon_pid', '5')")
+        con.execute(
+            "INSERT INTO sources (source_id, type, priority, schedule_s, key_label, baselined, "
+            "in_error, error_since, last_error, last_error_at, last_success_at, record_count) "
+            "VALUES ('portal', 'dir', 'high', 900, 'po', 1, 1, '2026-09-29T09:00:00Z', 'boom', "
+            "'2026-09-29T09:05:00Z', '2026-09-29T08:00:00Z', 1)"
+        )
+        con.execute(
+            "INSERT INTO records VALUES ('portal', '4500123', '{\"status\": \"Open\"}', 'h1', 1, "
+            "'2026-09-29T08:00:00Z')"
+        )
+        con.execute(
+            "INSERT INTO events (source_id, kind, record_key, field_changes_json, importance, "
+            "detail_json, created_at) VALUES ('portal', 'baseline', NULL, '[]', 10, "
+            "'{\"record_count\": 1}', '2026-09-29T08:00:00Z')"
+        )
+        con.execute("INSERT INTO cursors VALUES ('agent', 1, '2026-09-29T08:30:00Z')")
+    finally:
+        con.close()
+    return path
+
+
+def source_columns(store: Store) -> dict[str, sqlite3.Row]:
+    return {row["name"]: row for row in raw(store, "PRAGMA table_info(sources)")}
+
+
+def test_a_fresh_database_has_the_v2_source_columns(store: Store) -> None:
+    columns = source_columns(store)
+    assert columns["fingerprint"]["type"] == "TEXT" and columns["fingerprint"]["notnull"] == 0
+    assert columns["broken_json"]["notnull"] == 1
+    assert columns["broken_json"]["dflt_value"] == "'[]'"
+
+
+def test_open_migrates_a_v1_database_and_keeps_its_data(since_home_dir: Path) -> None:
+    make_v1_database(since_home_dir)
+
+    with Store.open() as s:
+        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("daemon_pid") == "5"
+        assert {"fingerprint", "broken_json"} <= set(source_columns(s))
+        assert s.get_source_state("portal") == SourceState(
+            source_id="portal",
+            type="dir",
+            priority="high",
+            schedule_s=900,
+            key_label="po",
+            configured=True,
+            baselined=True,
+            in_error=True,
+            error_since="2026-09-29T09:00:00Z",
+            last_error="boom",
+            last_error_at="2026-09-29T09:05:00Z",
+            last_success_at="2026-09-29T08:00:00Z",
+            record_count=1,
+            fingerprint=None,
+            broken=[],
+        )
+        assert raw(s, "SELECT broken_json FROM sources")[0][0] == "[]"  # the column default
+        assert list(s.get_snapshot("portal")) == ["4500123"]
+        assert [e.kind for e in s.events_after(0)] == ["baseline"]
+        assert s.get_cursor("agent") == 1
+        # the new columns are usable right away
+        s.update_source_state("portal", fingerprint="f1", broken=["td.x"])
+        s.upsert_source("newer", "web", "normal", 60)
+        assert s.get_source_state("newer").broken == []  # type: ignore[union-attr]
+
+    with Store.open() as s:  # reopening a migrated database changes nothing
+        assert s.get_meta("schema_version") == "2"
+        state = s.get_source_state("portal")
+        assert state is not None and (state.fingerprint, state.broken) == ("f1", ["td.x"])
+
+
+def test_migrating_a_v1_database_needs_the_write_lock(
+    since_home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = make_v1_database(since_home_dir)
+    monkeypatch.setattr(store_mod, "BUSY_TIMEOUT_MS", 200)
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Store.open()
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    with Store.open() as s:  # the failed attempt left nothing half-migrated
+        assert s.get_meta("schema_version") == "2"
+        assert "broken_json" in source_columns(s)
+
+
+def test_migration_of_a_database_that_already_has_the_columns_is_harmless(
+    since_home_dir: Path,
+) -> None:
+    with Store.open() as s:  # a v2 database whose version marker says v1
+        add_source(s, "docs")
+        s.update_source_state("docs", fingerprint="keep", broken=["a"])
+        s.set_meta("schema_version", "1")
+
+    with Store.open() as s:
+        assert s.get_meta("schema_version") == "2"
+        state = s.get_source_state("docs")
+        assert state is not None and (state.fingerprint, state.broken) == ("keep", ["a"])
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
@@ -206,6 +384,8 @@ def test_upsert_source_inserts_with_fresh_state(store: Store) -> None:
         last_error_at=None,
         last_success_at=None,
         record_count=0,
+        fingerprint=None,
+        broken=[],
     )
 
 
@@ -224,6 +404,8 @@ def test_upsert_source_updates_config_but_not_collection_state(store: Store) -> 
         last_error_at="2026-09-29T09:05:00Z",
         last_success_at="2026-09-29T08:00:00Z",
         record_count=12,
+        fingerprint="f1",
+        broken=["td.status"],
     )
     add_source(
         store, "docs", type="sql", priority="high", schedule_s=60, key_label="k", configured=False
@@ -243,6 +425,8 @@ def test_upsert_source_updates_config_but_not_collection_state(store: Store) -> 
         last_error_at="2026-09-29T09:05:00Z",
         last_success_at="2026-09-29T08:00:00Z",
         record_count=12,
+        fingerprint="f1",
+        broken=["td.status"],
     )
 
 
@@ -264,12 +448,32 @@ def test_update_source_state_converts_bools_and_datetimes(store: Store) -> None:
     assert store.get_source_state("docs").in_error is False  # type: ignore[union-attr]
 
 
+def test_update_source_state_stores_fingerprint_and_broken_as_json(store: Store) -> None:
+    add_source(store)
+    store.update_source_state("docs", fingerprint="abc123", broken=["table#o tr", 'td[x="é"]'])
+    state = store.get_source_state("docs")
+    assert state is not None
+    assert (state.fingerprint, state.broken) == ("abc123", ["table#o tr", 'td[x="é"]'])
+    assert raw(store, "SELECT broken_json FROM sources")[0][0] == '["table#o tr", "td[x=\\"é\\"]"]'
+    assert store.list_source_states()[0].broken == ["table#o tr", 'td[x="é"]']
+
+    store.update_source_state("docs", fingerprint=None, broken=[])  # cleared again
+    state = store.get_source_state("docs")
+    assert state is not None and (state.fingerprint, state.broken) == (None, [])
+    assert raw(store, "SELECT broken_json FROM sources")[0][0] == "[]"
+
+    store.update_source_state("docs", broken=("a", "b"))  # any sequence of str
+    assert store.get_source_state("docs").broken == ["a", "b"]  # type: ignore[union-attr]
+
+
 def test_update_source_state_rejects_bad_input(store: Store) -> None:
     add_source(store)
     with pytest.raises(ValueError, match="unknown source state column"):
         store.update_source_state("docs", bogus="x")
     with pytest.raises(ValueError, match="unknown source state column"):
         store.update_source_state("docs", **{"record_count = 0; --": 1})
+    with pytest.raises(ValueError, match="unknown source state column"):
+        store.update_source_state("docs", broken_json="[]")  # the API name is ``broken``
     with pytest.raises(KeyError):
         store.update_source_state("missing", record_count=1)
     store.update_source_state("docs")  # no columns: no-op
