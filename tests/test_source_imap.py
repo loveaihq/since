@@ -679,8 +679,8 @@ def test_the_client_only_sends_read_only_commands(
     server.add_message("Projects", subject="More")
     cfg = make_cfg(server, folders=["INBOX", "Projects"])
     run(store, cfg, clock)
-    assert server.command_names() == [
-        "CAPABILITY",
+    # Python 3.13's imaplib re-asks CAPABILITY after LOGIN; it is read-only, so ignore it here
+    assert [c for c in server.command_names() if c != "CAPABILITY"] == [
         "LOGIN",
         "EXAMINE",
         "UID SEARCH",
