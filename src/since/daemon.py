@@ -214,8 +214,11 @@ class Daemon:
             try:
                 # A long collection must not let the heartbeat go stale, or a second daemon could
                 # start; so beat with a fresh clock reading before every source, not just per tick.
-                self._store.set_meta(META_HEARTBEAT, to_iso(self._now_fn()))
-                result = run_collection(self._store, cfg, collector, now)
+                # The run is stamped with when it really started, so D15 can tell it from a
+                # concurrent `since collect` even if earlier sources in this tick were slow.
+                started = max(now, self._now_fn())
+                self._store.set_meta(META_HEARTBEAT, to_iso(started))
+                result = run_collection(self._store, cfg, collector, started)
             except Exception as exc:  # store error etc.; the run was rolled back
                 self._retry_at[cfg.id] = now + timedelta(seconds=cfg.schedule_s)
                 detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__

@@ -265,8 +265,9 @@ updates the snapshot without an event; a crash mid-write leaves no partial state
 Options: `path` (required, `~` expanded), `include` (globs, default `["**/*"]`), `exclude` (default `[]`),
 `max_text_bytes` (default 65536). Files only; don't follow symlinked dirs. key = relative POSIX path.
 fields: `size`; plus `text` if size <= max_text_bytes, valid UTF-8 and no NUL byte, else `sha256` (hex).
-No mtime (touching a file must not create an event). Missing root or any unreadable file → `CollectError`
-(whole run fails, D5). `key_label` = "".
+No mtime (touching a file must not create an event). Missing root or an unlistable directory → `CollectError`
+(whole run fails); a file that exists but can't be read → reported as unavailable, keeps its last known
+record (revised D5). `key_label` = "".
 Acceptance: tmp-dir tests for add/modify/remove through `run_collection`, binary vs text, include/exclude,
 nested paths use `/` on Windows, missing root → source_error, touch-only → no event.
 
