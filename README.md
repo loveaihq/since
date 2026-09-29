@@ -280,28 +280,35 @@ escapes every value, and refuses requests whose `Host` is not the local address.
 `bench/` holds a reproducible comparison: a deterministic 3-day simulated wholesale business (255
 mails, a 64-row PO table, an order portal that changes layout and later logs out) and one task —
 "list everything that needs attention since your last look", with four explicit rules and a
-rule-computed answer key of 18 items (16 observable by any tool; 2 happened after the portal became
-unreadable). Both arms run headless Claude Code (Sonnet) with nothing but their MCP tools: **A** gets
+rule-computed answer key of 18 items. 16 of them are observable by Since; 2 happened after the portal
+became unreadable, so no tool can see them. Arm A's tools can reach at most 13: at "now" the portal only
+shows a login page, so neither its order changes nor its layout change are visible to A.
+
+Both arms run headless Claude Code (Sonnet) with nothing but their MCP tools, a one-line neutral system
+prompt and no user settings or memory (so absolute token counts are lower than in normal use): **A** gets
 raw mail/SQL/portal tools plus its own notes from the last look (so it can diff in context), **B** gets
 Since. `python -m bench.run --arms A,B --runs 3 --channel msedge` reproduces it;
-[bench/REPORT.md](bench/REPORT.md) has the full numbers.
+[bench/REPORT.md](bench/REPORT.md) has the full numbers and the method.
 
-First run (2026-09-29, 3 runs per arm):
+First run (2026-09-29, 3 runs per arm; mean, range in brackets):
 
 | | A: raw tools + notes | B: Since |
 | --- | --- | --- |
-| Recall on observable items | 79% (75–81%) | **100%** (all runs) |
+| Recall on items observable by Since (16) | 79% (75–81%) | **100%** (all runs) |
+| Recall on items A's tools can reach (13) | 97% (92–100%) | 100% |
 | Precision | 100% | 100% |
-| Input tokens (incl. cache) | 31,285 (25,320–42,832) | 25,900 (25,822–26,042) |
-| Tool calls | 7 (6–8) | 3 |
+| Input tokens incl. cache (median) | 31,285 (25,320–42,832; median 25,704) | 25,900 (25,822–26,042; median 25,837) |
+| Tool calls / model requests | 7 / 3.3 | 3 / 3 |
 | Cost | $0.078 | $0.075 |
 
-What it shows: at this size the difference is mostly **what the agent can know**, not tokens. Arm A
-missed the portal changes that happened before the login expired and the layout change, because
-by the time it looks the portal only shows a login page; Since had recorded them while the portal was
-readable. Token use was ~17% lower and steadier with Since, and cost about the same — the simulated
-inbox is small and the raw agent filtered the PO table by `updated_at`. Larger or noisier sources
-were not measured yet.
+What it shows, and what it doesn't:
+- The difference here is **what the agent can know**. A missed the portal changes that happened before
+  the login expired and the layout change: by the time it looks, the portal shows only a login page.
+  Since had recorded them while the portal was readable. On what A could reach, both arms did well.
+- **Tokens and cost were about the same** in this small world: two of three A runs used slightly fewer
+  input tokens than B; one A run needed an extra model request and used 66% more. Since's runs were
+  steadier. The simulated inbox is small (118 new mails) and the raw agent filtered the PO table by
+  `updated_at`; larger or noisier sources were not measured yet.
 
 ## License
 
