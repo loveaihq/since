@@ -259,10 +259,11 @@ def test_key_label_and_default_title_fields() -> None:
     assert title_fields_for(configured, collector) == ["subject"]
 
 
-def test_default_track_fields_leave_out_seen() -> None:
+def test_default_track_fields_are_the_folder_only() -> None:
+    # D26 revised: flag changes on old mail must not outrank new mail
     collector = ImapCollector()
-    assert collector.default_track_fields(cfg_with()) == ["folder", "flagged", "answered"]
-    assert track_fields_for(cfg_with(), collector) == ["folder", "flagged", "answered"]
+    assert collector.default_track_fields(cfg_with()) == ["folder"]
+    assert track_fields_for(cfg_with(), collector) == ["folder"]
     configured = SourceConfig(id="inbox", type="imap", track_fields=["seen"], options=opts())
     assert track_fields_for(configured, collector) == ["seen"]  # the config wins
 
@@ -393,11 +394,29 @@ def test_new_mail_is_a_titled_added_event_and_digest_line(
     assert any(line.startswith(expected) for line in lines), digest
 
 
-def test_flagging_a_mail_is_a_modified_flagged_event(
+def test_flagging_or_answering_a_mail_makes_no_event_by_default(
+    server: FakeImapServer, store: Store, clock: Clock
+) -> None:
+    # D26 revised: only `folder` is tracked by default; the snapshot is refreshed silently
+    server.add_message("INBOX", subject="Please read")
+    cfg = make_cfg(server)
+    run(store, cfg, clock)
+    server.set_flags("INBOX", 1, FLAGGED)
+    clock.advance(minutes=15)
+    assert run(store, cfg, clock) == CollectResult(seqs=[], error=None)
+    server.set_flags("INBOX", 1, FLAGGED, ANSWERED)
+    clock.advance(minutes=15)
+    assert run(store, cfg, clock) == CollectResult(seqs=[], error=None)
+    assert [e.kind for e in events(store)] == [KIND_BASELINE]
+    fields = store.get_snapshot("inbox")["<m1@example.test>"].fields
+    assert (fields["flagged"], fields["answered"]) == (True, True)
+
+
+def test_flagging_a_mail_is_a_modified_flagged_event_when_configured(
     server: FakeImapServer, store: Store, clock: Clock
 ) -> None:
     server.add_message("INBOX", subject="Please read")
-    cfg = make_cfg(server)
+    cfg = replace(make_cfg(server), track_fields=["flagged"])
     run(store, cfg, clock)
     server.set_flags("INBOX", 1, FLAGGED)
     clock.advance(minutes=15)
@@ -422,9 +441,10 @@ def test_reading_a_mail_makes_no_event_but_updates_the_snapshot(
     assert [e.kind for e in events(store)] == [KIND_BASELINE]
     assert store.get_snapshot("inbox")["<m1@example.test>"].fields["seen"] is True
     # the next diff compares against the refreshed snapshot: flagging afterwards shows only that
+    tracking_flags = replace(cfg, track_fields=["seen", "flagged"])
     server.set_flags("INBOX", 1, SEEN, FLAGGED)
     clock.advance(minutes=15)
-    run(store, cfg, clock)
+    run(store, tracking_flags, clock)
     modified = events(store)[-1]
     assert modified.kind == KIND_MODIFIED
     assert [(c.field, c.old, c.new) for c in modified.field_changes] == [("flagged", False, True)]
@@ -434,7 +454,7 @@ def test_a_flag_change_that_includes_seen_reports_only_the_tracked_flags(
     server: FakeImapServer, store: Store, clock: Clock
 ) -> None:
     server.add_message("INBOX", subject="Please read")
-    cfg = make_cfg(server)
+    cfg = replace(make_cfg(server), track_fields=["flagged", "answered"])
     run(store, cfg, clock)
     server.set_flags("INBOX", 1, SEEN, FLAGGED, ANSWERED)
     clock.advance(minutes=15)
@@ -450,9 +470,10 @@ def test_configured_track_fields_replace_the_imap_default(
     server: FakeImapServer, store: Store, clock: Clock
 ) -> None:
     server.add_message("INBOX", subject="Please read")
-    cfg = replace(make_cfg(server), track_fields=["seen"])
+    server.add_mailbox("Projects")
+    cfg = replace(make_cfg(server, folders=["INBOX", "Projects"]), track_fields=["seen"])
     run(store, cfg, clock)
-    server.set_flags("INBOX", 1, FLAGGED)  # tracked by default, not by this config
+    server.set_flags("INBOX", 1, FLAGGED)  # tracked by neither the default nor this config
     clock.advance(minutes=15)
     assert run(store, cfg, clock).seqs == []
     server.set_flags("INBOX", 1, FLAGGED, SEEN)
@@ -461,6 +482,14 @@ def test_configured_track_fields_replace_the_imap_default(
     modified = events(store)[-1]
     assert modified.kind == KIND_MODIFIED
     assert [(c.field, c.old, c.new) for c in modified.field_changes] == [("seen", False, True)]
+    # a move is tracked by the default, but this config replaced it
+    server.delete_message("INBOX", 1)
+    server.add_message(
+        "Projects", uid=1, subject="Please read", flags=(FLAGGED, SEEN)
+    )  # message id <m1@...> again
+    clock.advance(minutes=15)
+    assert run(store, cfg, clock).seqs == []
+    assert store.get_snapshot("inbox")["<m1@example.test>"].fields["folder"] == "Projects"
 
 
 def test_a_mail_moved_to_another_folder_is_a_modified_folder_event(

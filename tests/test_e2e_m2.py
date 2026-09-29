@@ -127,7 +127,14 @@ def only(pattern: str, lines: list[str]) -> re.Match[str]:
     return found[0]
 
 
-def write_config(home: Path, imap: FakeImapServer, api: FakeApi, site: Site, days: int) -> None:
+def write_config(
+    home: Path,
+    imap: FakeImapServer,
+    api: FakeApi,
+    site: Site,
+    days: int,
+    inbox_track_fields: list[str] | None = None,
+) -> None:
     web: dict[str, Any] = {
         "id": "sps-portal",
         "type": "web",
@@ -145,19 +152,23 @@ def write_config(home: Path, imap: FakeImapServer, api: FakeApi, site: Site, day
     }
     if CHANNEL:
         web["browser_channel"] = CHANNEL
+    inbox: dict[str, Any] = {
+        "id": "inbox",
+        "type": "imap",
+        "priority": "normal",
+        "host": imap.host,
+        "port": imap.port,
+        "security": "none",
+        "username": IMAP_USER,
+        "password_env": IMAP_PW_ENV,
+        "folders": ["INBOX", "Archive"],
+        "since_days": days,
+    }
+    if inbox_track_fields is not None:
+        inbox["track_fields"] = inbox_track_fields  # replaces the imap default (D26 revised)
     config = {
         "sources": [
-            {
-                "id": "inbox",
-                "type": "imap",
-                "priority": "normal",
-                "host": imap.host,
-                "port": imap.port,
-                "security": "none",
-                "username": IMAP_USER,
-                "password_env": IMAP_PW_ENV,
-                "since_days": days,
-            },
+            inbox,
             {
                 "id": "watches",
                 "type": "changedetection",
@@ -195,11 +206,11 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
 
         # The inbox (window: 14 days): two recent mails, one 10 days old, one 20 days old that
         # is outside the window and therefore never collected.
+        imap.add_mailbox("Archive")  # configured too; empty at first
         edi = "EDI Desk <edi@supplier.example>"
+        ap = "AP Team <ap@customer.example>"
         asn = mail(2, "<asn@supplier.example>", "Re: DJ ASN rejection", edi, "\\Seen")
-        unread = mail(
-            3, "<inv@customer.example>", "Invoice 4471 overdue", "AP Team <ap@customer.example>"
-        )
+        unread = mail(3, "<inv@customer.example>", "Invoice 4471 overdue", ap)
         aged = mail(
             10, "<q3@supplier.example>", "Quarterly report Q3", "Reports <r@supplier.example>"
         )
@@ -230,13 +241,23 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
             assert group(digest, header) == ["  = baseline: 3 records"], header
         assert "Ancient" not in run.out
 
-        # 2. Mutate: a new mail; a mail flagged (an event); another mail marked unread again (a
-        #    `seen`-only change: no event, D26); a mail that ages out (the window shrinks to 7 days
-        #    and the 10-day-old mail is deleted, like the 20-day-old one); a watch's snapshot text
-        #    (a real change moves last_changed too); a portal row Open -> Cancelled.
-        mail(0.05, "<asn-new@supplier.example>", "PO 4500123 cancelled - please confirm", edi)
-        imap.set_flags("INBOX", unread, "\\Flagged")
-        imap.set_flags("INBOX", asn)  # was \Seen
+        # 2. Mutate: a new mail; a mail moved to the Archive folder (an event); another mail flagged
+        #    and marked unread again (flag and `seen` changes: no event by default, D26 revised); a
+        #    mail that ages out (the window shrinks to 7 days and the 10-day-old mail is deleted,
+        #    like the 20-day-old one); a watch's snapshot text (a real change moves last_changed
+        #    too); a portal row Open -> Cancelled.
+        new_mail = mail(
+            0.05, "<asn-new@supplier.example>", "PO 4500123 cancelled - please confirm", edi
+        )
+        imap.delete_message("INBOX", unread)
+        imap.add_message(
+            "Archive",
+            message_id="<inv@customer.example>",
+            subject="Invoice 4471 overdue",
+            from_=ap,
+            internaldate=now - timedelta(days=3),
+        )
+        imap.set_flags("INBOX", asn, "\\Flagged")  # was \Seen
         imap.delete_message("INBOX", aged)
         imap.delete_message("INBOX", ancient)
         write_config(home, imap, api, site, days=7)
@@ -265,16 +286,18 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert digest.index("[normal] inbox (3)") < digest.index("[low] watches (2)")
         assert group(digest, "[high] sps-portal") == [portal_line, "  = baseline: 3 records"]
         assert group(digest, "[normal] inbox") == [
-            # a tracked-field modification (flagged) weighs more than an addition; the mail that
-            # was only marked unread again (`seen`, not tracked by default, D26) has no line.
-            # Titles are subject, sender and the time the mail was received (D29).
+            # a tracked-field modification (folder) weighs more than an addition; the mail that
+            # was only flagged and marked unread (`flagged` / `seen`, not tracked by default,
+            # D26 revised) has no line. Titles are subject, sender and the time the mail was
+            # received (D29).
             '  ~ "Invoice 4471 overdue" from "AP Team <ap@customer.example>"'
-            f' {received(now, 3)} flagged: "False" -> "True"',
+            f' {received(now, 3)} folder: "INBOX" -> "Archive"',
             # collector-default track fields are not listed on added lines (D26)
             f'  + "PO 4500123 cancelled - please confirm" from "{edi}" {received(now, 0.05)}',
             "  = baseline: 3 records",
         ]
         assert "ASN rejection" not in run.out and "seen" not in run.out
+        assert "flagged" not in run.out  # a flagged-only change is no event by default
         assert group(digest, "[low] watches") == [
             f'  ~ "Supplier price list" last_changed: "{CHANGED_1_ISO}" -> "{CHANGED_2_ISO}"; '
             "text changed (+1/-1 chars)",
@@ -311,10 +334,11 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert run.lines[0].startswith(f"{mail_rec} · inbox · present · updated ")
         assert 'subject: "PO 4500123 cancelled - please confirm"' in run.lines
         assert f'from: "{edi}"' in run.lines
-        # the mail that was only marked unread again made no event, but its record follows it
+        # the mail that was only flagged and marked unread made no event, but its record follows it
         run = since("get", "since://rec/inbox/" + quote("<asn@supplier.example>", safe="/|"))
         assert run.code == 0
         assert 'seen: "False"' in run.lines and 'subject: "Re: DJ ASN rejection"' in run.lines
+        assert 'flagged: "True"' in run.lines
 
         # 5. ack next_cursor.
         next_cursor = int(only(r"next_cursor=(\d+)$", digest[:1]).group(1))
@@ -414,6 +438,19 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert only(r"^\[high\] sps-portal \(web\) · records 3 · ", status.lines).string.endswith(
             " · ok"
         )
+
+        # 7b. `track_fields` in the config replaces the imap default (D26 revised): with
+        #     `[flagged]`, flagging the new mail is an event.
+        write_config(home, imap, api, site, days=7, inbox_track_fields=["flagged"])
+        imap.set_flags("INBOX", new_mail, "\\Flagged")
+        run = since("collect", "inbox")
+        assert (run.code, run.out.strip()) == (0, "inbox: 1 events (seq 11-11)"), run.err
+        run = since("digest")
+        assert run.code == 0
+        assert group(run.lines, "[normal] inbox (1)") == [
+            '  ~ "PO 4500123 cancelled - please confirm" from "EDI Desk <edi@supplier.example>"'
+            f' {received(now, 0.05)} flagged: "False" -> "True"'
+        ]
 
     # 8. No credential anywhere: not in any CLI output, not in the database files. The fakes saw
     #    only what a read-only collector sends, with the credentials.

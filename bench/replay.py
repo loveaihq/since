@@ -10,11 +10,13 @@
 - a local HTTP server for the ``web`` source: ``/orders`` serves ``portal_html`` of the tick's
   portal state, or redirects to ``/login`` once the login has expired.
 
-The three sources are configured the plain way an operator would (no highlight rules, nothing keyed
-to the answer key); the same config is written to ``<home>/since.yaml`` for reference (its ports
-belong to the replay run). At the ``LAST_LOOK`` tick the bench agent (``agent_id="bench"``) is
-acked to the highest seq: what Since holds after that is "what changed since I last looked". After
-the last tick a fresh heartbeat is written, so digests carry no stale-daemon warning.
+The three sources are configured the plain way an operator would (D37: po-table and sps-portal carry
+the ``highlight: [{field: status, changed_to: Cancelled}]`` rule of CLAUDE.md's example, nothing
+else is keyed to the answer key); the same config is written to ``<home>/since.yaml`` for reference
+(its ports belong to the replay run). At the ``LAST_LOOK`` tick the bench agent
+(``agent_id="bench"``) is acked to the highest seq: what Since holds after that is "what changed
+since I last looked". After the last tick a fresh heartbeat is written, so digests carry no
+stale-daemon warning.
 
 The report says, for every planted item, whether its reference shows up in the full digest of the
 bench agent, and for the ones that do not, why (a portal change after the layout change or after the
@@ -94,6 +96,8 @@ _PO_DDL = (
     "status TEXT NOT NULL, eta TEXT NOT NULL, qty INTEGER NOT NULL, updated_at TEXT NOT NULL)"
 )
 PO_QUERY = f"select {', '.join(_PO_COLUMNS)} from {PO_TABLE}"
+# D37: the highlight rule of CLAUDE.md's config example (+10 importance on status -> Cancelled)
+CANCELLED_HIGHLIGHT: list[dict[str, str]] = [{"field": "status", "changed_to": "Cancelled"}]
 
 REASON_LAYOUT = "after layout change"
 REASON_LOGIN = "after login expiry"
@@ -238,8 +242,9 @@ def build_config(
     browser_channel: str | None = None,
 ) -> dict[str, Any]:
     """The ``since.yaml`` of the replay as a plain dict: three sources configured the ordinary way
-    (priorities, key and tracked fields, the M2 extractor written for layout v1). No highlight rules
-    and nothing that depends on the planted content. Credentials come from env vars only."""
+    (priorities, key and tracked fields, the M2 extractor written for layout v1). The only highlight
+    rule is the one of CLAUDE.md's example, on po-table and sps-portal (D37); nothing else depends
+    on the planted content. Credentials come from env vars only."""
     portal: dict[str, Any] = {
         "id": SOURCE_PORTAL,
         "type": "web",
@@ -250,6 +255,7 @@ def build_config(
         "login_detect": {"selector": PORTAL_LOGIN_SELECTOR},
         "extract": copy.deepcopy(PORTAL_V1_EXTRACT),
         "track_fields": ["status", "ship_by"],
+        "highlight": copy.deepcopy(CANCELLED_HIGHLIGHT),
     }
     if browser_channel:
         portal["browser_channel"] = browser_channel
@@ -277,6 +283,7 @@ def build_config(
                 "query": PO_QUERY,
                 "key": ["po_no"],
                 "track_fields": ["status", "eta"],
+                "highlight": copy.deepcopy(CANCELLED_HIGHLIGHT),
             },
             portal,
         ]

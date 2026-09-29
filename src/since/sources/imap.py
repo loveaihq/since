@@ -47,9 +47,11 @@ Only when even one day matches more than ``max_messages`` mails does it keep the
 one day (this assumes UIDs grow with the received time; a folder that violates this may show a
 mail that fell out of the cap as removed).
 
-Default ``track_fields`` (D26): ``folder``, ``flagged``, ``answered``. A mail merely being read
-(``seen``) makes no event; a ``track_fields`` option in the config replaces the default. Default
-title fields (D17, D29): ``subject``, ``from``, ``received``.
+Default ``track_fields`` (D26 revised): ``folder`` only. A mail merely being read (``seen``),
+flagged or answered makes no event, so that an old mail's flag change (modified) cannot outrank a
+new mail (added) in the digest; a ``track_fields`` option in the config replaces the default
+(``track_fields: [folder, flagged, answered]`` tracks flags again). Default title fields (D17,
+D29): ``subject``, ``from``, ``received``.
 
 Errors reaching the stored ``source_error`` never contain the password: the messages are fixed
 texts (``login failed for <username>``, raised as ``LoginRequired``, D24) or scrubbed reasons of
@@ -269,10 +271,10 @@ class ImapCollector:
         return ["subject", "from", "received"]
 
     def default_track_fields(self, cfg: SourceConfig) -> list[str]:
-        """A mail merely being read (``seen``) is not news and must not outrank new mail (D26);
-        ``flagged`` / ``answered`` and a move to another folder are. ``track_fields`` in the
-        config replaces this."""
-        return ["folder", "flagged", "answered"]
+        """Only a move to another folder is news (D26 revised): a mail being read (``seen``),
+        flagged or answered must not outrank new mail. ``track_fields`` in the config replaces
+        this."""
+        return ["folder"]
 
     def collect(self, cfg: SourceConfig) -> CollectOutput:
         try:

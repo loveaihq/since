@@ -2604,7 +2604,7 @@ def test_builtin_collectors_other_than_imap_track_every_field_by_default() -> No
     for type_name in ("dir", "sql", "web", "changedetection"):
         assert track_fields_for(make_cfg(type=type_name), get_collector(type_name)) is None
     imap = get_collector("imap")
-    assert track_fields_for(make_cfg(type="imap"), imap) == ["folder", "flagged", "answered"]
+    assert track_fields_for(make_cfg(type="imap"), imap) == ["folder"]  # D26 revised
 
 
 def test_collector_default_track_fields_limit_the_events_but_not_the_snapshot(

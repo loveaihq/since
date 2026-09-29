@@ -92,16 +92,16 @@ sources:
 Each mail of the last `since_days` days is a record (headers only, never the body): fields
 `subject`, `from`, `to`, `date`, `received`, `folder`, `seen`, `flagged`, `answered`, `size`
 (`received` is when the server took the mail in). A mail shows up as `+ "Invoice 4471" from "AP Team
-<ap@customer.example>" at 2026-09-26 09:08Z`, a flag change as `~ ... flagged: "False" -> "True"`, a
-deleted mail as `-`; mail that ages out of the window is dropped silently. A mail that sits in several
-folders (Gmail labels) counts once. The window is judged on `received`, per folder, with a one-day
-margin (servers apply `SINCE` to the date in their own time zone). If a folder has more than
+<ap@customer.example>" at 2026-09-26 09:08Z`, a mail moved to another folder as `~ ... folder: "INBOX"
+-> "Archive"`, a deleted mail as `-`; mail that ages out of the window is dropped silently. A mail that
+sits in several folders (Gmail labels) counts once. The window is judged on `received`, per folder,
+with a one-day margin (servers apply `SINCE` to the date in their own time zone). If a folder has more than
 `max_messages` mails in the window, Since shortens that folder's window (fewer days) instead of cutting
 the list, so the mails it does keep are complete for the days it claims; only when a single day alone
 exceeds `max_messages` does it fall back to that day's newest mails.
-By default only `folder`, `flagged` and `answered` are tracked: a mail merely being read (`seen`)
-makes no event, so it cannot outrank new mail. Set `track_fields` to change that
-(`track_fields: [seen, flagged]`).
+By default only `folder` is tracked (a mail moved to another folder): a mail being read (`seen`),
+flagged or answered makes no event, so an old mail's flag change cannot outrank new mail. Set
+`track_fields` to change that (`track_fields: [folder, flagged, answered]`).
 The collector is read-only (`EXAMINE` and `BODY.PEEK` only): it never marks a mail as read.
 
 Gmail and Google Workspace: turn IMAP on in the account, enable 2-step verification and create an

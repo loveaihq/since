@@ -69,6 +69,7 @@ from bench.world import (
     portal_html,
 )
 from since.config import Config, load_config, parse_config
+from since.model import HIGHLIGHT_BONUS_DEFAULT
 from since.sources.imap import ImapCollector
 from since.sources.sql import SqlCollector
 from since.store import Store
@@ -125,8 +126,12 @@ def test_config_is_plain_and_valid(tmp_path: Path) -> None:
     assert portal.options["browser_channel"] == "msedge"
     assert portal.track_fields == ["status", "ship_by"]
 
-    # plain: no highlight rules, so nothing is tuned to the planted content
-    assert all(not s.highlight for s in config.sources)
+    # D37: only CLAUDE.md's example rule (status changed to Cancelled) on po-table and sps-portal;
+    # nothing else is tuned to the planted content
+    rule = [("status", "changed_to", "Cancelled", HIGHLIGHT_BONUS_DEFAULT)]
+    for source in (po, portal):
+        assert [(r.field, r.op, r.value, r.bonus) for r in source.highlight] == rule
+    assert not inbox.highlight
     # credentials only by env var name
     assert inbox.options["password_env"] == IMAP_PASSWORD_ENV
     assert po.options["url_env"] == PO_URL_ENV
