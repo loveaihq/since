@@ -9,7 +9,7 @@ Config keys (unknown keys are rejected)::
     password_env: SINCE_IMAP_PW   # name of the env var holding the password (D9: never YAML)
     folders: [INBOX]              # default; names are quoted and sent as IMAP modified UTF-7
     since_days: 14                # 1-365, default 14
-    max_messages: 500             # 1-5000 per folder, default 500; the newest UIDs win
+    max_messages: 500             # 1-5000 per folder, default 500; see "The cap" below
 
 Read-only by construction (D20): the collector only ever sends CAPABILITY (imaplib does), LOGIN,
 EXAMINE, ``UID SEARCH SINCE``, ``UID FETCH ... BODY.PEEK[HEADER.FIELDS (...)]`` and LOGOUT. It never
@@ -18,14 +18,38 @@ Only stdlib ``imaplib`` / ``email`` are used.
 
 Record: key = Message-ID (stripped), or ``uid:<folder>/<uidvalidity>/<uid>`` when the mail has none;
 fields ``subject``, ``from`` (first address, ``Name <addr>``), ``to`` (first 3 addresses), ``date``
-(Date header as ISO UTC, else INTERNALDATE), ``folder``, ``seen``, ``flagged``, ``answered``,
-``size``. A mail that shows up under the same Message-ID in several folders (Gmail labels) is kept
-once: first by folder order in the config, then by ascending UID. The result carries
-``Window("date", <00:00 UTC of the SINCE day>)`` so mails aging out of the window are dropped
-without a ``removed`` event (D21).
+(Date header as ISO UTC, else INTERNALDATE), ``received`` (INTERNALDATE as ISO UTC: the moment the
+server took the mail in, and what ``SEARCH SINCE`` filters on; the Date header only when the
+server sent no usable INTERNALDATE), ``folder``, ``seen``, ``flagged``, ``answered``, ``size``.
+A mail that shows up under the same Message-ID in several folders (Gmail labels) is kept once:
+first by folder order in the config, then by ascending UID.
+
+The window (D20/D21 revised). The result carries ``Window("received", <start>, scope_field="folder",
+starts={folder: <start of that folder>})`` (``<start>``, for a mail of a folder that is no longer
+configured, is the start for ``since_days``): a mail of the previous snapshot that is absent from
+the result and was *received* before its folder's start has aged out and leaves the snapshot
+without a ``removed`` event; a mail absent although received on or after that start is a real
+removal. It is the ``received`` time, not the Date header, that is compared, because that is what
+the server filters on: ``SEARCH SINCE`` compares the *date* of INTERNALDATE in the server's own
+time zone, which Since cannot know. So each folder's start is 00:00 UTC of its SINCE day **plus
+one day**, a margin that covers every time zone. The price: a mail that is deleted at the source
+while it was received on the SINCE day or earlier (the last day at the far end of the window)
+leaves the snapshot silently instead of as ``removed``.
+
+The cap (``max_messages``, per folder). The newest mails are never silently dropped from a window
+that claims to cover them, so the SINCE date is shortened instead of cutting the result: when
+``SEARCH SINCE`` for ``since_days`` matches more than ``max_messages`` mails, the number of days is
+bisected (1 .. ``since_days``, with further ``UID SEARCH SINCE`` calls) to the largest day count
+that matches at most ``max_messages`` mails; that folder is collected for that many days only and
+its window start is that (shorter) SINCE day plus one day. Mails older than that age out silently.
+Only when even one day matches more than ``max_messages`` mails does it keep the newest
+``max_messages`` UIDs of that day and set the folder's start to the oldest kept ``received`` plus
+one day (this assumes UIDs grow with the received time; a folder that violates this may show a
+mail that fell out of the cap as removed).
 
 Default ``track_fields`` (D26): ``folder``, ``flagged``, ``answered``. A mail merely being read
-(``seen``) makes no event; a ``track_fields`` option in the config replaces the default.
+(``seen``) makes no event; a ``track_fields`` option in the config replaces the default. Default
+title fields (D17, D29): ``subject``, ``from``, ``received``.
 
 Errors reaching the stored ``source_error`` never contain the password: the messages are fixed
 texts (``login failed for <username>``, raised as ``LoginRequired``, D24) or scrubbed reasons of
@@ -73,6 +97,9 @@ DEFAULT_MAX_MESSAGES = 500
 MAX_SINCE_DAYS = 365
 MAX_MAX_MESSAGES = 5000
 BATCH_SIZE = 100
+# Servers apply SEARCH SINCE to the INTERNALDATE date in their own time zone: window starts get a
+# day of margin (see the module docstring).
+_MARGIN = timedelta(days=1)
 TIMEOUT_S = 30  # socket timeout of every IMAP operation, seconds
 MAX_TO_ADDRESSES = 3
 
@@ -239,7 +266,7 @@ class ImapCollector:
         return ""
 
     def default_title_fields(self, cfg: SourceConfig) -> list[str]:
-        return ["subject", "from"]
+        return ["subject", "from", "received"]
 
     def default_track_fields(self, cfg: SourceConfig) -> list[str]:
         """A mail merely being read (``seen``) is not news and must not outrank new mail (D26);
@@ -253,15 +280,14 @@ class ImapCollector:
         except ConfigError as exc:
             raise CollectError(str(exc)) from None
         password = _read_password(s)
-        start = _since_start(self._now_fn(), s.since_days)
-        since_arg = _imap_date(start)
+        now = self._now_fn()
         secrets = _secrets(password)
 
         conn: imaplib.IMAP4 | None = None
         try:
             conn = _connect(s, secrets)
             _login(conn, s, password, secrets)
-            records = _collect_folders(conn, s, since_arg)
+            records, starts = _collect_folders(conn, s, now)
         except CollectError:
             raise
         except Exception as exc:
@@ -269,7 +295,14 @@ class ImapCollector:
         finally:
             _logout(conn)
         records.sort(key=lambda r: r.key)
-        return CollectOutput(records, window=Window("date", to_iso(start)))
+        start = _since_start(now, s.since_days) + _MARGIN
+        window = Window(
+            "received",
+            to_iso(start),
+            scope_field="folder",
+            starts={folder: to_iso(folder_start) for folder, folder_start in starts.items()},
+        )
+        return CollectOutput(records, window=window)
 
 
 def _read_password(s: _Settings) -> str:
@@ -352,7 +385,8 @@ def _login(conn: imaplib.IMAP4, s: _Settings, password: str, secrets: list[str])
         raise CollectError(f"connection lost during login: {_reason(exc, secrets)}") from None
     except imaplib.IMAP4.error:
         # Never echo the server's text: it is untrusted and could quote what we sent.
-        raise LoginRequired(f"login failed for {s.username}") from None
+        hint = f"check the app password in {s.password_env}"
+        raise LoginRequired(f"login failed for {s.username}", hint) from None
 
 
 def _logout(conn: imaplib.IMAP4 | None) -> None:
@@ -397,22 +431,78 @@ def _search(conn: imaplib.IMAP4, folder: str, since_arg: str) -> list[int]:
     return sorted(uids)
 
 
-def _collect_folders(conn: imaplib.IMAP4, s: _Settings, since_arg: str) -> list[Record]:
+@dataclass(frozen=True)
+class _Pick:
+    """The UIDs of one folder to fetch: ascending, from a ``SEARCH SINCE`` of ``days`` days;
+    ``capped`` when even one day matched more than ``max_messages``: only the newest were kept."""
+
+    uids: list[int]
+    days: int
+    capped: bool
+
+
+def _pick_uids(conn: imaplib.IMAP4, folder: str, s: _Settings, now: datetime) -> _Pick:
+    """The UIDs to fetch from the selected folder: everything ``SEARCH SINCE`` finds for
+    ``since_days`` if that is at most ``max_messages``; else those of the largest day count
+    (bisected with further searches) that stays within the cap; else the newest ``max_messages``
+    of one day."""
+    found: dict[int, list[int]] = {}
+
+    def search(days: int) -> list[int]:
+        if days not in found:
+            found[days] = _search(conn, folder, _imap_date(_since_start(now, days)))
+        return found[days]
+
+    if len(search(s.since_days)) <= s.max_messages:
+        return _Pick(found[s.since_days], s.since_days, False)
+    # The match count grows with the day count: lo (0 days: nothing) fits the cap, hi does not.
+    lo, hi = 0, s.since_days
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if len(search(mid)) <= s.max_messages:
+            lo = mid
+        else:
+            hi = mid
+    if lo > 0:
+        return _Pick(found[lo], lo, False)
+    return _Pick(found[hi][-s.max_messages :], hi, True)  # hi is 1: even one day is over the cap
+
+
+def _folder_start(now: datetime, pick: _Pick, fetched: dict[int, _Fetched]) -> datetime:
+    """The window start of a folder: its SINCE day plus a day; when only the newest of one day were
+    kept, the oldest of them plus a day."""
+    start = _since_start(now, pick.days) + _MARGIN
+    if pick.capped:
+        received = [item.internaldate for item in fetched.values() if item.internaldate]
+        if received:
+            try:
+                start = min(received).astimezone(UTC) + _MARGIN
+            except (ValueError, OverflowError):
+                pass
+    return start
+
+
+def _collect_folders(
+    conn: imaplib.IMAP4, s: _Settings, now: datetime
+) -> tuple[list[Record], dict[str, datetime]]:
+    """The records of all folders and the window start of each folder."""
     records: list[Record] = []
+    starts: dict[str, datetime] = {}
     seen: set[str] = set()
     for folder in s.folders:
         uidvalidity = _examine(conn, folder)
-        uids = _search(conn, folder, since_arg)[-s.max_messages :]  # newest UIDs first choice
+        pick = _pick_uids(conn, folder, s, now)
         fetched: dict[int, _Fetched] = {}
-        for i in range(0, len(uids), BATCH_SIZE):
-            for item in _fetch(conn, folder, uids[i : i + BATCH_SIZE]):
+        for i in range(0, len(pick.uids), BATCH_SIZE):
+            for item in _fetch(conn, folder, pick.uids[i : i + BATCH_SIZE]):
                 fetched.setdefault(item.uid, item)
+        starts[folder] = _folder_start(now, pick, fetched)
         for uid in sorted(fetched):  # (folder order, UID ascending): the first duplicate wins
             key, fields = _mail_fields(folder, uidvalidity, fetched[uid])
             if key not in seen:
                 seen.add(key)
                 records.append(Record.make(key, fields))
-    return records
+    return records, starts
 
 
 # -- FETCH responses -----------------------------------------------------------------------------
@@ -549,6 +639,16 @@ def _addresses(msg: email.message.Message, name: str, limit: int) -> str:
     return ", ".join(found[:limit])
 
 
+def _internaldate_iso(internaldate: datetime | None) -> str | None:
+    """INTERNALDATE as ISO UTC; ``None`` when there is none (or it is out of range)."""
+    if internaldate is not None:
+        try:
+            return to_iso(internaldate)
+        except (ValueError, OverflowError):
+            pass
+    return None
+
+
 def _date_field(msg: email.message.Message, internaldate: datetime | None) -> str | None:
     """The Date header as ISO UTC; missing, unparseable or implausible -> INTERNALDATE."""
     text = _header_text(msg, "Date")
@@ -562,23 +662,21 @@ def _date_field(msg: email.message.Message, internaldate: datetime | None) -> st
                 return to_iso(moment)
         except (TypeError, ValueError, IndexError, OverflowError):
             pass
-    if internaldate is not None:
-        try:
-            return to_iso(internaldate)
-        except (ValueError, OverflowError):
-            pass
-    return None
+    return _internaldate_iso(internaldate)
 
 
 def _mail_fields(folder: str, uidvalidity: str, item: _Fetched) -> tuple[str, dict[str, Scalar]]:
     """(key, fields) of one fetched mail."""
     msg = email.message_from_bytes(item.header, policy=email.policy.default)
     key = _header_text(msg, "Message-ID") or f"uid:{folder}/{uidvalidity}/{item.uid}"
+    date = _date_field(msg, item.internaldate)
+    received = _internaldate_iso(item.internaldate)
     fields: dict[str, Scalar] = {
         "subject": _header_text(msg, "Subject"),
         "from": _addresses(msg, "From", 1),
         "to": _addresses(msg, "To", MAX_TO_ADDRESSES),
-        "date": _date_field(msg, item.internaldate),
+        "date": date,
+        "received": received if received is not None else date,
         "folder": folder,
         "seen": "\\seen" in item.flags,
         "flagged": "\\flagged" in item.flags,

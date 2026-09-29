@@ -592,9 +592,9 @@ def test_a_uuid_is_percent_encoded_in_the_snapshot_path(api: FakeApi, store: Sto
 # -- failures: nothing is ever "removed" ----------------------------------------------------------
 
 
-def _assert_failure_keeps_the_snapshot(store: Store, message: str) -> None:
+def _assert_failure_keeps_the_snapshot(store: Store, message: str, **detail: str) -> None:
     assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
-    assert events(store)[1].detail == {"error": message}
+    assert events(store)[1].detail == {"error": message, **detail}
     assert sorted(store.get_snapshot(SID)) == [W1, W2]
     state = store.get_source_state(SID)
     assert state is not None and state.in_error and state.record_count == 2
@@ -610,7 +610,9 @@ def test_a_rejected_api_key_is_reported_without_details(
     result = run(store, make_cfg(api), 1)
 
     assert result.error == "API key rejected"
-    _assert_failure_keeps_the_snapshot(store, "API key rejected")
+    _assert_failure_keeps_the_snapshot(
+        store, "API key rejected", hint=f"check the API key in {ENV}"
+    )
     assert_no_secret(store, KEY)
 
 
@@ -647,6 +649,39 @@ def test_a_rejected_api_key_raises_login_required(api: FakeApi, path: str, statu
         ChangedetectionCollector().collect(make_cfg(api))
 
     assert str(info.value) == "API key rejected"
+    assert info.value.hint == f"check the API key in {ENV}"  # what a human does about it
+
+
+def test_a_rejected_key_without_api_key_env_says_to_configure_one(api: FakeApi) -> None:
+    api.fail["*"] = 401
+
+    with pytest.raises(LoginRequired) as info:
+        ChangedetectionCollector().collect(make_cfg(api, remove=("api_key_env",)))
+
+    assert str(info.value) == "API key rejected"
+    assert info.value.hint == (
+        "the instance wants an API key: set api_key_env to the name of an env var holding it"
+    )
+
+
+def test_the_hint_is_stored_with_the_event_and_shown_after_the_message(
+    api: FakeApi, store: Store
+) -> None:
+    api.fail["*"] = 401
+    assert run(store, make_cfg(api)).error == "API key rejected"
+    [error] = [e for e in events(store) if e.kind == KIND_SOURCE_ERROR]
+    assert error.detail == {"error": "API key rejected", "hint": f"check the API key in {ENV}"}
+    digest = Service(store, lambda: at(5)).since()
+    assert (
+        f'  ! source_error: "API key rejected"; needs a human: check the API key in {ENV}'
+        "  since://evt/1" in digest.splitlines()
+    )
+
+
+def test_the_hint_never_carries_the_key(api: FakeApi, store: Store) -> None:
+    api.fail["*"] = 401
+    run(store, make_cfg(api))
+    assert_no_secret(store, KEY)
 
 
 def test_other_http_errors_are_not_login_problems(api: FakeApi) -> None:

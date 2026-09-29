@@ -4,9 +4,14 @@ source over a tmp directory. Output is captured with capsys; nothing touches the
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
+import os
+import signal
+import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,10 +23,9 @@ import since.mcp_server
 from since.cli import main
 from since.collect import register_sources, run_collection
 from since.config import Config, SourceConfig
-from since.daemon import META_HEARTBEAT, META_PID
+from since.daemon import META_HEARTBEAT, META_PID, Daemon
 from since.sources.dir import DirCollector
 from since.store import Store
-from since.timeutil import to_iso
 
 
 @pytest.fixture
@@ -318,20 +322,103 @@ def test_daemon_once_collects_every_source_and_exits_0(
         assert store.get_meta(META_PID) is None  # ...but is no longer "the running daemon"
 
 
-def test_second_daemon_is_refused_with_exit_1(
+HOLDER = """
+import io
+import os
+import sys
+from datetime import UTC, datetime
+from since.config import Config
+from since.daemon import Daemon
+from since.store import Store
+
+store = Store.open()
+Daemon(
+    Config(), store, lambda: datetime.now(UTC), lambda seconds: None, log=io.StringIO()
+).start()
+print("ready", os.getpid(), flush=True)
+sys.stdin.readline()  # hold the daemon lock until the test says stop (or kills this process)
+"""
+
+
+class LockHolder:
+    """A separate process that started a daemon (D30) and keeps its lock. ``pid`` is the
+    interpreter's own (on Windows ``Popen`` may hold a launcher for it)."""
+
+    def __init__(self, proc: subprocess.Popen[str], pid: int) -> None:
+        self.proc, self.pid = proc, pid
+
+    def kill(self) -> None:
+        """A crash: nothing gets to release the lock or clean up."""
+        with contextlib.suppress(OSError):
+            os.kill(self.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        self.proc.kill()
+        self.proc.wait(10)
+
+
+@pytest.fixture
+def lock_holder(config: Path) -> Iterator[LockHolder]:
+    """A LockHolder on the test's SINCE_HOME."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", HOLDER],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        ready = proc.stdout.readline().split()
+        assert ready[:1] == ["ready"], (proc.stderr.read() if proc.stderr else "")[-500:]
+        holder = LockHolder(proc, int(ready[1]))
+        yield holder
+    finally:
+        holder.kill()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def test_second_daemon_is_refused_with_exit_1_while_another_process_holds_the_lock(
+    lock_holder: LockHolder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for argv in (("daemon", "--once"), ("daemon",)):  # --once too: it must not run beside a daemon
+        code, out, err = run(capsys, *argv)
+        assert code == 1
+        assert out == ""
+        assert err == "error: another daemon is running\n"
+    with Store.open() as store:
+        assert store.events_after(0) == []  # the refused daemon collected nothing
+        assert store.get_meta(META_PID) == str(lock_holder.pid)  # the holder's claim is untouched
+
+
+def test_the_lock_dies_with_its_process(
+    lock_holder: LockHolder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run(capsys, "daemon", "--once")[0] == 1
+    lock_holder.kill()  # a crash: nothing gets to release the lock or clean up
+
+    code, out, err = run(capsys, "daemon", "--once")
+
+    assert (code, out) == (0, "")  # the OS released it
+    assert err.endswith(" docs: 1 events\n")  # the daemon's own log line
+    with Store.open() as store:
+        assert [e.kind for e in store.events_after(0)] == ["baseline"]
+
+
+def test_second_daemon_is_refused_with_exit_1_in_process(
     config: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     with Store.open() as store:
-        store.set_meta(META_PID, 99999999)  # someone else's pid...
-        store.set_meta(META_HEARTBEAT, to_iso(datetime.now(UTC)))  # ...with a fresh heartbeat
-    code, out, err = run(capsys, "daemon", "--once")
-    assert code == 1
-    assert out == ""
-    assert "another daemon is running" in err and "99999999" in err
-    with Store.open() as store:
-        assert store.get_meta(META_PID) == "99999999"  # the other daemon's claim is untouched
-        assert store.get_meta(META_HEARTBEAT) is not None
-        assert store.events_after(0) == []
+        holder = Daemon(
+            Config(), store, lambda: datetime.now(UTC), lambda seconds: None, log=io.StringIO()
+        )
+        holder.start()
+        try:
+            code, out, err = run(capsys, "daemon", "--once")
+        finally:
+            holder.close()
+    assert (code, out, err) == (1, "", "error: another daemon is running\n")
+    assert run(capsys, "daemon", "--once")[0] == 0  # released: the next one runs
 
 
 # -- login ---------------------------------------------------------------------------------------

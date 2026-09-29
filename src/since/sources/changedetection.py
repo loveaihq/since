@@ -165,15 +165,29 @@ class _HttpStatus(Exception):
 class _Api:
     """GET requests against one changedetection.io instance."""
 
-    def __init__(self, base_url: str, api_key: str | None, timeout_s: int) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str | None,
+        timeout_s: int,
+        api_key_env: str | None = None,
+    ) -> None:
         self._base = base_url
         self._api_key = api_key
         self._timeout = timeout_s
+        self._api_key_env = api_key_env
         self._secrets = [api_key] if api_key else []
         self._opener = urllib.request.build_opener(_NoRedirect)
 
     def scrub(self, message: str) -> str:
         return _scrub(message, self._secrets)
+
+    def key_hint(self) -> str:
+        """What a human does about a rejected API key: check the one in the named env var, or, when
+        the source names none, configure one."""
+        if self._api_key_env:
+            return f"check the API key in {self._api_key_env}"
+        return "the instance wants an API key: set api_key_env to the name of an env var holding it"
 
     def get(
         self, path: str, query: Mapping[str, str] | None, max_bytes: int, *, truncate: bool
@@ -197,7 +211,7 @@ class _Api:
             status = exc.code
             exc.close()
             if status in (401, 403):
-                raise LoginRequired("API key rejected") from None
+                raise LoginRequired("API key rejected", self.key_hint()) from None
             raise _HttpStatus(status, path) from None
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
             reason = _reason_text(exc)
@@ -277,12 +291,14 @@ class ChangedetectionCollector:
             if not (api_key.isascii() and api_key.isprintable()):
                 # http.client would echo the value in its own error: refuse it up front.
                 raise CollectError(f"environment variable {api_key_env} holds an invalid API key")
-        api = _Api(base_url, api_key, timeout_s)
+        api = _Api(base_url, api_key, timeout_s, api_key_env)
         try:
             return self._collect(api, tag, fetch_text)
+        except LoginRequired as exc:
+            # keep the class and the hint: a rejected API key must stay a LoginRequired (D24)
+            raise LoginRequired(api.scrub(str(exc)), api.scrub(exc.hint)) from None
         except CollectError as exc:
-            # keep the class: a rejected API key must stay a LoginRequired (D24)
-            raise type(exc)(api.scrub(str(exc))) from None
+            raise CollectError(api.scrub(str(exc))) from None
         except Exception as exc:
             raise CollectError(api.scrub(f"{type(exc).__name__}: {exc}")) from None
 

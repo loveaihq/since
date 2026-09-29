@@ -2011,14 +2011,15 @@ def test_a_fingerprint_that_appears_later_is_stored_without_an_event(
     assert structure(store) == (F1, [])
 
 
-def test_without_a_fingerprint_no_page_structure_logic_runs(
+def test_without_a_fingerprint_there_is_no_layout_tracking(
     store: Store, fake: FakeCollector
 ) -> None:
     cfg = make_cfg()
     run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
 
-    # ``broken`` alone means nothing: an ordinary success, and the stored structure is kept
-    result = run(store, cfg, fake, out([rec("a", v=2)], broken=[ROWS]), 5)
+    # a run that reports no fingerprint: an ordinary success, the stored structure is kept and
+    # nothing is compared with it
+    result = run(store, cfg, fake, out([rec("a", v=2)]), 5)
 
     assert result.error is None and len(result.seqs) == 1
     assert kinds(store) == [(KIND_BASELINE, None), (KIND_MODIFIED, "a")]
@@ -2026,10 +2027,60 @@ def test_without_a_fingerprint_no_page_structure_logic_runs(
     assert state is not None and state.in_error is False and state.last_success_at == to_iso(at(5))
     assert structure(store) == (F1, [])
 
-    # ... also on the first run
-    other = FakeCollector()
-    run(store, make_cfg("other"), other, out([rec("x", v=1)], broken=[ROWS]), 0)
-    assert kinds(store, "other") == [(KIND_BASELINE, None)]
+
+def test_broken_selectors_are_honoured_without_a_fingerprint(
+    store: Store, fake: FakeCollector
+) -> None:
+    # D18 revised (QA 2): `fingerprint_depth: 0` must not turn a layout change into a wave of
+    # `removed`
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1), rec("b", v=1)]), 0)
+    before = _db_state(store)
+
+    result = run(store, cfg, fake, out([], broken=[ROWS]), 5)
+
+    events = store.events_after(0, "src")
+    assert [e.kind for e in events] == [KIND_BASELINE, KIND_SCHEMA_CHANGED]  # no removed
+    assert events[1].detail == {"selectors": [ROWS]}
+    assert result == CollectResult(seqs=[events[1].seq], error=ROWS_MESSAGE)
+    after = _db_state(store)
+    assert after[3] == before[3] and after[4] == before[4]  # snapshot and record rows untouched
+    state = store.get_source_state("src")
+    assert state is not None
+    assert (state.in_error, state.record_count, state.baselined) == (True, 2, True)
+    assert state.last_success_at == to_iso(at(0))
+    assert structure(store) == (None, [ROWS])
+    assert state.announced_error == ROWS_MESSAGE
+
+    # the lasting broken state is announced once, and the recovery is just source_recovered
+    run(store, cfg, fake, out([], broken=[ROWS]), 10)
+    run(store, cfg, fake, out([rec("a", v=1), rec("b", v=1)]), 15)
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_SCHEMA_CHANGED, None),
+        (KIND_SOURCE_RECOVERED, None),
+    ]
+    state = store.get_source_state("src")
+    assert state is not None and state.in_error is False and state.announced_error is None
+    assert structure(store) == (None, [])  # cleared by the good run: a new break is news again
+
+    run(store, cfg, fake, out([], broken=[ROWS]), 20)
+    assert kinds(store)[-1] == (KIND_SCHEMA_CHANGED, None)
+    assert len(store.events_after(0, "src")) == 4
+
+
+def test_a_first_run_with_broken_selectors_and_no_fingerprint_is_no_baseline(
+    store: Store, fake: FakeCollector
+) -> None:
+    # e.g. a login page that has no `login_detect`: rows match nothing, "baseline: 0 records"
+    # would be wrong
+    result = run(store, make_cfg(), fake, out([], broken=[ROWS]), 0)
+
+    assert result.error == ROWS_MESSAGE and len(result.seqs) == 1
+    assert kinds(store) == [(KIND_SOURCE_ERROR, None)]
+    state = store.get_source_state("src")
+    assert state is not None and (state.baselined, state.in_error) == (False, True)
+    assert store.get_snapshot("src") == {}
 
 
 def test_a_broken_run_after_an_ordinary_failure_is_a_schema_changed_in_the_same_streak(
@@ -2211,13 +2262,16 @@ def test_crash_after_a_layout_schema_changed_rolls_everything_back(
 # -- login problems are always surfaced (D24) ----------------------------------------------------
 
 LOGIN_EXPIRED = "login expired"
+HINT = "run since login sps-portal"
 
 
-def test_login_required_is_a_collect_error_with_its_message() -> None:
+def test_login_required_is_a_collect_error_with_its_message_and_an_optional_hint() -> None:
     exc = LoginRequired(LOGIN_EXPIRED)
 
     assert isinstance(exc, CollectError)
-    assert str(exc) == LOGIN_EXPIRED
+    assert str(exc) == LOGIN_EXPIRED and exc.hint == ""
+    hinted = LoginRequired(LOGIN_EXPIRED, HINT)
+    assert str(hinted) == LOGIN_EXPIRED and hinted.hint == HINT
 
 
 def test_a_login_failure_of_a_healthy_source_is_an_ordinary_source_error(
@@ -2297,9 +2351,122 @@ def test_a_plain_error_after_a_login_error_stays_deduplicated(
     assert result == CollectResult(seqs=[], error="connection refused")
     assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
 
-    # ... but when the login problem is back, that is news again (the message changed)
+
+def test_login_failure_network_blip_login_failure_is_announced_once(
+    store: Store, fake: FakeCollector
+) -> None:
+    # QA 4: a plain error in between overwrites `last_error`, but it announces nothing, so the
+    # same login problem coming back is not news
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    first = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED, HINT), 5)
+    run(store, cfg, fake, CollectError("network blip"), 10)
+
+    again = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED, HINT), 15)
+    run(store, cfg, fake, CollectError("network blip"), 20)
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED, HINT), 25)
+
+    assert len(first.seqs) == 1 and again == CollectResult(seqs=[], error=LOGIN_EXPIRED)
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
+    state = store.get_source_state("src")
+    assert state is not None
+    assert (state.last_error, state.last_error_at) == (LOGIN_EXPIRED, to_iso(at(25)))
+    assert state.announced_error == LOGIN_EXPIRED and state.error_since == to_iso(at(5))
+
+    # the next streak starts from scratch: recovery clears what was announced
+    run(store, cfg, fake, [rec("a", v=1)], 30)
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error is None
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED, HINT), 35)
+    assert [k for k, _ in kinds(store)] == [
+        KIND_BASELINE,
+        KIND_SOURCE_ERROR,
+        KIND_SOURCE_RECOVERED,
+        KIND_SOURCE_ERROR,
+    ]
+
+
+def test_every_appended_source_error_sets_announced_error(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error is None
+
+    run(store, cfg, fake, CollectError("down"), 5)  # a plain first error is announced
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error == "down"
+
+    run(store, cfg, fake, CollectError("still down"), 10)  # not announced: unchanged
+    state = store.get_source_state("src")
+    assert state is not None
+    assert (state.last_error, state.announced_error) == ("still down", "down")
+
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 15)  # a login problem: announced
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error == LOGIN_EXPIRED
+
+    run(store, cfg, fake, [rec("a", v=1)], 20)  # recovery clears it
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error is None
+
+
+def test_a_broken_extraction_announces_its_message_and_a_later_login_error_still_differs(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
+
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error == ROWS_MESSAGE
+
+    # broken again (same selectors): quiet, and announced_error is unchanged
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 10)
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error == ROWS_MESSAGE
+    assert len(kinds(store)) == 2
+
     run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 15)
+    state = store.get_source_state("src")
+    assert state is not None and state.announced_error == LOGIN_EXPIRED
     assert kinds(store)[2:] == [(KIND_SOURCE_ERROR, None)]
+
+
+def test_a_login_error_carries_its_hint_in_the_event_detail(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(priority="high")
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+
+    result = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED, HINT), 5)
+
+    error = store.events_after(0)[-1]
+    assert result == CollectResult(seqs=[error.seq], error=LOGIN_EXPIRED)  # the hint is no message
+    assert error.detail == {"error": LOGIN_EXPIRED, "hint": HINT}
+    assert error.importance == 15  # stored importance is the plain one
+    state = store.get_source_state("src")
+    assert state is not None and state.last_error == LOGIN_EXPIRED
+
+
+def test_a_plain_error_and_a_login_error_without_a_hint_have_no_hint_in_the_detail(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, CollectError("down"), 0)
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 5)
+
+    plain, login = store.events_after(0)
+    assert plain.detail == {"error": "down"}
+    assert login.detail == {"error": LOGIN_EXPIRED}
+
+
+def test_a_hint_is_capped(store: Store, fake: FakeCollector) -> None:
+    run(store, make_cfg(), fake, LoginRequired(LOGIN_EXPIRED, "x" * 800), 0)
+
+    (event,) = store.events_after(0)
+    assert len(event.detail["hint"]) == MAX_ERROR_CHARS and event.detail["hint"].endswith("…")
 
 
 def test_a_login_error_with_another_message_is_announced_again(
@@ -2340,6 +2507,26 @@ def test_a_login_error_after_a_broken_extraction_is_announced(
     # fingerprint, D25)
     run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 15)
     assert kinds(store)[3:] == [(KIND_SOURCE_RECOVERED, None)]
+
+
+def test_still_broken_after_a_login_error_is_announced_again(
+    store: Store, fake: FakeCollector
+) -> None:
+    # broken -> login expired -> logged in but the page is still broken: the agent's last word was
+    # "log in", so the broken state must be announced again (same selectors or not)
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 10)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 15)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 20)
+
+    assert [k for k, _ in kinds(store)] == [
+        KIND_BASELINE,
+        KIND_SCHEMA_CHANGED,
+        KIND_SOURCE_ERROR,
+        KIND_SCHEMA_CHANGED,
+    ]
 
 
 def test_a_login_error_on_the_first_run_is_announced_once(

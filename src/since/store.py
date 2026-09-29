@@ -23,7 +23,7 @@ from since.model import KINDS, Event, FieldChange, Record
 from since.paths import db_path
 from since.timeutil import to_iso
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
 DB_FILENAME = "since.db"
 
@@ -52,7 +52,8 @@ _SCHEMA = (
         last_success_at TEXT,
         record_count INTEGER NOT NULL DEFAULT 0,
         fingerprint TEXT,
-        broken_json TEXT NOT NULL DEFAULT '[]'
+        broken_json TEXT NOT NULL DEFAULT '[]',
+        announced_error TEXT
     )
     """,
     """
@@ -100,16 +101,18 @@ _SCHEMA = (
     """,
 )
 
-# Columns that schema v2 added to ``sources`` (D18): what an opened v1 database is migrated with.
-_V2_SOURCE_COLUMNS = (
+# Columns that later schema versions added to ``sources``: what an opened older database is
+# migrated with. v2 (D18): fingerprint, broken_json. v3 (D24 revised): announced_error.
+_ADDED_SOURCE_COLUMNS = (
     ("fingerprint", "TEXT"),
     ("broken_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("announced_error", "TEXT"),
 )
 
 _SOURCE_COLUMNS = (
     "source_id, type, priority, schedule_s, key_label, configured, baselined, in_error, "
     "error_since, last_error, last_error_at, last_success_at, record_count, fingerprint, "
-    "broken_json"
+    "broken_json, announced_error"
 )
 # Columns update_source_state may set (everything except the primary key). ``broken`` is a list
 # of str, stored as JSON in the ``broken_json`` column.
@@ -129,6 +132,7 @@ _UPDATABLE_COLUMNS = frozenset(
         "record_count",
         "fingerprint",
         "broken",
+        "announced_error",
     }
 )
 _BOOL_COLUMNS = frozenset({"configured", "baselined", "in_error"})
@@ -146,7 +150,9 @@ class StoreError(Exception):
 class SourceState:
     """Persistent per-source state. Times are stored ISO strings (or None). ``fingerprint`` and
     ``broken`` are the page structure last seen by a source that tracks it (D18): the structural
-    fingerprint and the sorted extractor selectors that matched nothing."""
+    fingerprint and the sorted extractor selectors that matched nothing. ``announced_error`` is
+    the message of the last ``source_error`` (or broken-extraction ``schema_changed``) announced
+    in the current error streak, ``None`` outside a streak (D24 revised)."""
 
     source_id: str
     type: str
@@ -163,6 +169,7 @@ class SourceState:
     record_count: int
     fingerprint: str | None = None
     broken: list[str] = field(default_factory=list)
+    announced_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +214,7 @@ def _state_from_row(row: sqlite3.Row) -> SourceState:
         record_count=row["record_count"],
         fingerprint=row["fingerprint"],
         broken=json.loads(row["broken_json"]),
+        announced_error=row["announced_error"],
     )
 
 
@@ -312,11 +320,11 @@ class Store:
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def _add_missing_source_columns(self) -> None:
-        """v1 -> v2: ``ALTER TABLE sources ADD COLUMN`` for each v2 column the table lacks. A
-        table just created from the current DDL already has them; checking the actual columns
+        """v1/v2 -> v3: ``ALTER TABLE sources ADD COLUMN`` for each later column the table lacks.
+        A table just created from the current DDL already has them; checking the actual columns
         (not just the version) also makes a repeated or concurrent migration harmless."""
         have = {row["name"] for row in self._conn.execute("PRAGMA table_info(sources)")}
-        for name, ddl in _V2_SOURCE_COLUMNS:
+        for name, ddl in _ADDED_SOURCE_COLUMNS:
             if name not in have:
                 self._conn.execute(f"ALTER TABLE sources ADD COLUMN {name} {ddl}")
 

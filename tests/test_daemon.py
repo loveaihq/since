@@ -8,13 +8,14 @@ import sqlite3
 import sys
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 import since.daemon as daemon_mod
 from since.collect import run_collection
-from since.config import Config, SourceConfig
+from since.config import Config, ConfigError, SourceConfig
 from since.daemon import META_HEARTBEAT as HEARTBEAT
 from since.daemon import Daemon, DaemonError
 from since.model import KIND_BASELINE, KIND_SOURCE_ERROR, KIND_SOURCE_RECOVERED, Record
@@ -133,14 +134,16 @@ def log() -> io.StringIO:
 @pytest.fixture
 def make_daemon(
     store: Store, clock: Clock, sleeper: Sleeper, fake: FakeCollector, log: io.StringIO
-) -> Callable[..., Daemon]:
+) -> Iterator[Callable[..., Daemon]]:
+    made: list[Daemon] = []
+
     def factory(
         *sources: SourceConfig,
         pid: int = 1001,
         retention_days: int = 30,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> Daemon:
-        return Daemon(
+        daemon = Daemon(
             Config(sources=list(sources), retention_days=retention_days),
             store,
             clock,
@@ -149,8 +152,14 @@ def make_daemon(
             log=log,
             pid=pid,
         )
+        made.append(daemon)
+        return daemon
 
-    return factory
+    try:
+        yield factory
+    finally:
+        for daemon in made:  # a test that only called start() must not keep the lock
+            daemon.close()
 
 
 def kinds(store: Store, source_id: str) -> list[str]:
@@ -210,57 +219,38 @@ def test_no_collectable_sources_writes_no_min_schedule_and_warns(
 
 
 @pytest.mark.parametrize(
-    ("other_pid", "heartbeat_age", "refused"),
-    [
-        ("2000", 0, True),
-        ("2000", 29, True),
-        ("2000", 30, False),
-        ("2000", 3600, False),
-        ("2000", None, False),  # pid left behind without a heartbeat
-        ("1001", 5, False),  # our own pid
-        ("2000", "garbage", False),
-    ],
+    ("other_pid", "heartbeat_age"),
+    [("2000", 0), ("2000", 5), ("2000", 3600), ("2000", None), ("1001", 5), ("2000", "garbage")],
 )
-def test_start_refuses_when_another_daemon_has_a_fresh_heartbeat(
-    store: Store,
-    make_daemon: Callable[..., Daemon],
-    other_pid: str,
-    heartbeat_age: Any,
-    refused: bool,
+def test_a_leftover_pid_and_heartbeat_never_block_a_start(
+    store: Store, make_daemon: Callable[..., Daemon], other_pid: str, heartbeat_age: Any
 ) -> None:
+    # D30: only the OS lock decides whether another daemon runs; a fresh heartbeat left behind by
+    # a crashed daemon (or by `--once`) is no reason to refuse
     store.set_meta("daemon_pid", other_pid)
     if isinstance(heartbeat_age, str):
         store.set_meta("daemon_heartbeat_at", heartbeat_age)
     elif heartbeat_age is not None:
         store.set_meta("daemon_heartbeat_at", stamp(-heartbeat_age))
-    d = make_daemon(src("a"))
-    if refused:
-        with pytest.raises(DaemonError, match="pid 2000"):
-            d.start()
-        # nothing was written by the refused daemon
-        assert store.get_meta("daemon_pid") == "2000"
-        assert store.get_meta("daemon_heartbeat_at") == stamp(-heartbeat_age)
-        assert store.get_meta("daemon_min_schedule_s") is None
-        assert store.list_source_states() == []
-    else:
-        d.start()
-        assert store.get_meta("daemon_pid") == "1001"
-        assert store.get_meta("daemon_heartbeat_at") == stamp(0)
+
+    make_daemon(src("a")).start()
+
+    assert store.get_meta("daemon_pid") == "1001"
+    assert store.get_meta("daemon_heartbeat_at") == stamp(0)
 
 
-def test_second_daemon_is_refused_while_the_first_runs(
-    store: Store,
-    make_daemon: Callable[..., Daemon],
-    clock: Clock,
-    sleeper: Sleeper,
+def test_second_daemon_is_refused_while_the_first_holds_the_lock(
+    store: Store, make_daemon: Callable[..., Daemon], clock: Clock
 ) -> None:
     first = make_daemon(src("a"), pid=1001)
     second = make_daemon(src("a"), pid=1002)
     first.start()
-    clock.advance(10)
-    with pytest.raises(DaemonError):
+    clock.advance(3600)  # an old heartbeat does not matter either: the lock does
+    with pytest.raises(DaemonError, match="^another daemon is running$"):
         second.start()
+    # nothing was written by the refused daemon
     assert store.get_meta("daemon_pid") == "1001"
+    assert store.get_meta("daemon_heartbeat_at") == stamp(0)
     # after the first one stopped cleanly the second may start
     first.run(once=True)
     assert store.get_meta("daemon_pid") is None
@@ -268,17 +258,105 @@ def test_second_daemon_is_refused_while_the_first_runs(
     assert store.get_meta("daemon_pid") == "1002"
 
 
-def test_refused_run_leaves_the_other_daemons_meta_alone(
+def test_the_lock_is_a_file_next_to_the_database_that_stays_empty(
+    since_home_dir: Path, make_daemon: Callable[..., Daemon]
+) -> None:
+    make_daemon(src("a")).start()
+
+    lock = since_home_dir / "daemon.lock"
+    assert lock.is_file() and lock.stat().st_size == 0
+    make_daemon(src("a")).close()  # closing a daemon that never started is harmless
+    assert lock.is_file()  # never deleted, so two daemons can never lock two different files
+
+
+def test_the_lock_is_per_file_so_another_home_has_its_own_daemon(
+    tmp_path: Path, fake: FakeCollector, clock: Clock, sleeper: Sleeper, log: io.StringIO
+) -> None:
+    other_home = tmp_path / "other-home"
+    with Store.open(other_home) as other_store, Store.open() as main_store:
+
+        def daemon(store: Store) -> Daemon:
+            return Daemon(Config(sources=[src("a")]), store, clock, sleeper, {"dir": fake}, log, 1)
+
+        first, second = daemon(main_store), daemon(other_store)
+        try:
+            first.start()
+            second.start()  # another database, another lock file
+            assert (other_home / "daemon.lock").is_file()
+            with pytest.raises(DaemonError, match="another daemon is running"):
+                daemon(main_store).start()
+        finally:
+            first.close()
+            second.close()
+
+
+def test_a_refused_run_leaves_the_other_daemons_meta_alone(
     store: Store, make_daemon: Callable[..., Daemon]
 ) -> None:
-    store.set_meta("daemon_pid", "2000")
-    store.set_meta("daemon_heartbeat_at", stamp(-5))
+    holder = make_daemon(src("a"), pid=1001)
+    holder.start()
+    before = (store.get_meta("daemon_pid"), store.get_meta("daemon_heartbeat_at"))
+    # the same pid on purpose: what a refused daemon owns is decided by the lock, not by the pid
+    with pytest.raises(DaemonError, match="another daemon is running"):
+        make_daemon(src("a"), pid=1001).run()
+    with pytest.raises(DaemonError, match="another daemon is running"):
+        make_daemon(src("a"), pid=1001).run(once=True)  # --once while a daemon runs
+    assert (store.get_meta("daemon_pid"), store.get_meta("daemon_heartbeat_at")) == before
+    assert store.list_source_states()[0].source_id == "a"
+
+
+def test_a_start_that_fails_after_the_lock_gives_the_lock_back(
+    store: Store, make_daemon: Callable[..., Daemon], fake: FakeCollector
+) -> None:
+    def broken_validate(cfg: SourceConfig) -> None:
+        raise ConfigError("bad config")
+
+    fake.validate = broken_validate  # type: ignore[method-assign]
+    with pytest.raises(ConfigError):
+        make_daemon(src("a")).start()
+    del fake.validate  # the class method again
+    make_daemon(src("a")).start()  # the lock is free
+
+
+def test_run_releases_the_lock_however_it_ends(
+    store: Store, make_daemon: Callable[..., Daemon]
+) -> None:
+    def broken_sleep(seconds: float) -> None:
+        raise RuntimeError("sleep exploded")
+
+    with pytest.raises(RuntimeError):
+        make_daemon(src("a"), sleep_fn=broken_sleep).run()
+    make_daemon(src("a")).start()  # free again
+    other = make_daemon(src("a"), pid=1002)
     with pytest.raises(DaemonError):
-        make_daemon(src("a")).run()
-    with pytest.raises(DaemonError):
-        make_daemon(src("a")).run(once=True)
-    assert store.get_meta("daemon_pid") == "2000"
-    assert store.get_meta("daemon_heartbeat_at") == stamp(-5)
+        other.start()
+
+
+def test_close_is_idempotent_and_releases_the_lock(
+    make_daemon: Callable[..., Daemon],
+) -> None:
+    first = make_daemon(src("a"))
+    first.start()
+    first.close()
+    first.close()
+    make_daemon(src("a"), pid=1002).start()
+
+
+def test_a_daemon_can_be_started_twice_without_locking_itself_out(
+    make_daemon: Callable[..., Daemon],
+) -> None:
+    d = make_daemon(src("a"))
+    d.start()
+    d.start()
+    assert d.tick(at(0)) == ["a"]
+
+
+def test_a_failing_lock_file_is_a_daemon_error_not_a_crash(
+    since_home_dir: Path, make_daemon: Callable[..., Daemon]
+) -> None:
+    (since_home_dir / "daemon.lock").mkdir()  # cannot be opened as a file
+    with pytest.raises(DaemonError, match="cannot open"):
+        make_daemon(src("a")).start()
 
 
 def test_tick_before_start_is_an_error(make_daemon: Callable[..., Daemon]) -> None:
@@ -347,6 +425,7 @@ def test_due_time_comes_from_the_stored_state_not_from_memory(
     first = make_daemon(src("a", 60))
     first.start()
     assert first.tick(at(0)) == ["a"]
+    first.close()  # the old process is gone
     restarted = make_daemon(src("a", 60))  # a new process, same database
     restarted.start()
     assert restarted.tick(at(10)) == []
@@ -396,6 +475,8 @@ def test_heartbeat_is_refreshed_with_the_current_time_before_every_source_run(
 def test_a_second_daemon_is_refused_between_long_collections(
     make_daemon: Callable[..., Daemon], fake: FakeCollector, clock: Clock
 ) -> None:
+    # QA 12: the old 30 s heartbeat window was shorter than one web collection; the lock is held
+    # for as long as the daemon lives, however long a collection takes
     second = make_daemon(src("b"), pid=1002)
     outcomes: list[str] = []
 
@@ -414,7 +495,11 @@ def test_a_second_daemon_is_refused_between_long_collections(
 
     d.tick(at(0))
 
-    assert outcomes == ["refused"]  # the heartbeat written before b's run is only 0s old
+    assert outcomes == ["refused"]
+    fake.results["a"] = _slow_collect(clock, 100_000)  # even a collection of more than a day
+    fake.results["b"] = _slow_collect(clock, 0, second_start_attempt)
+    d.tick(at(5000))  # due again
+    assert outcomes == ["refused", "refused"]
 
 
 def test_a_failing_heartbeat_write_is_isolated_like_any_store_error(
@@ -695,7 +780,7 @@ def test_once_keeps_the_last_heartbeat_and_a_later_daemon_may_start(
     assert store.get_meta("daemon_pid") is None
     assert store.get_meta("daemon_heartbeat_at") == stamp(5)
 
-    clock.advance(1)  # well inside the 30s window: the leftover heartbeat does not block a start
+    clock.advance(1)  # a fresh leftover heartbeat does not block a start (the lock decides)
     make_daemon(src("a"), pid=1002).start()
     assert store.get_meta("daemon_pid") == "1002"
 

@@ -96,6 +96,13 @@ class Since:
         return run
 
 
+def received(now: datetime, days_ago: float) -> str:
+    """How a digest title shows a mail received ``days_ago`` days before ``now`` (D29):
+    ``at 2026-09-29 09:12Z``; INTERNALDATE has one-second resolution, the title one minute."""
+    when = (now - timedelta(days=days_ago)).astimezone(UTC)
+    return f"at {when:%Y-%m-%d %H:%M}Z"
+
+
 def event_lines(digest: list[str]) -> list[str]:
     """Every event line (two-space indented) of a digest, handle included."""
     return [line for line in digest if line.startswith("  ")]
@@ -259,11 +266,12 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert group(digest, "[high] sps-portal") == [portal_line, "  = baseline: 3 records"]
         assert group(digest, "[normal] inbox") == [
             # a tracked-field modification (flagged) weighs more than an addition; the mail that
-            # was only marked unread again (`seen`, not tracked by default, D26) has no line
+            # was only marked unread again (`seen`, not tracked by default, D26) has no line.
+            # Titles are subject, sender and the time the mail was received (D29).
             '  ~ "Invoice 4471 overdue" from "AP Team <ap@customer.example>"'
-            ' flagged: "False" -> "True"',
+            f' {received(now, 3)} flagged: "False" -> "True"',
             # collector-default track fields are not listed on added lines (D26)
-            f'  + "PO 4500123 cancelled - please confirm" from "{edi}"',
+            f'  + "PO 4500123 cancelled - please confirm" from "{edi}" {received(now, 0.05)}',
             "  = baseline: 3 records",
         ]
         assert "ASN rejection" not in run.out and "seen" not in run.out
@@ -371,9 +379,14 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
             "since · agent=default · events 9-9 (1) · budget 800 · next_cursor=9",
             NOTE,
             "[high] sps-portal (1)",
-            '  ! source_error: "login expired"  since://evt/9',
+            # what a human has to do about it (D24 revised), in Since's own words
+            '  ! source_error: "login expired"; needs a human: run since login sps-portal'
+            "  since://evt/9",
             "after handling: ack(cursor=9)",
         ]
+        run = since("get", "since://evt/9")
+        assert run.code == 0
+        assert run.lines[-1] == 'error: "login expired"; needs a human: run since login sps-portal'
         run = since("collect", "sps-portal")
         assert (run.code, run.out.strip()) == (1, 'sps-portal: collection failed: "login expired"')
         run = since("digest")
@@ -390,9 +403,11 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         digest = run.lines
         assert digest[0] == "since · agent=default · events 9-10 (2) · budget 800 · next_cursor=10"
         assert group(digest, "[high] sps-portal (2)") == [
-            '  ! source_error: "login expired" (recovered)',  # the digest marks errors that ended
+            # the digest marks errors that ended, and no longer asks a human to do anything (D28)
+            '  ! source_error: "login expired" (recovered)',
             "  ^ source_recovered",
         ]
+        assert "needs a human" not in run.out
         assert "schema_changed" not in run.out  # the identical page is not a layout change
         assert not re.search(r"^  [-+~]", run.out, re.MULTILINE)  # the cancellation is not repeated
         status = since("status")

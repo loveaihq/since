@@ -66,7 +66,7 @@ def test_open_creates_home_and_wal_db(since_home_dir: Path) -> None:
     try:
         assert (since_home_dir / "since.db").is_file()
         assert s.path == since_home_dir / "since.db"
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
     finally:
         s.close()
     # journal_mode is persistent in the db file: a fresh connection sees wal.
@@ -96,7 +96,7 @@ def test_reopen_keeps_data(since_home_dir: Path) -> None:
         assert list(s.get_snapshot("docs")) == ["a"]
         assert s.max_seq() == 1
         assert s.get_cursor("agent") == 1
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
 
 
 def test_newer_schema_version_is_refused(since_home_dir: Path) -> None:
@@ -119,7 +119,7 @@ def test_open_of_an_existing_database_does_not_take_the_write_lock(
         started = time.monotonic()
         with Store.open() as reader:  # a read-only command (digest, status, mcp) must not wait
             assert reader.get_cursor("agent") == 7
-            assert reader.get_meta("schema_version") == "2"
+            assert reader.get_meta("schema_version") == "3"
         assert time.monotonic() - started < 1.0
 
         # control: with the schema check forced onto the write path the open does block
@@ -136,7 +136,7 @@ def test_open_of_an_empty_database_file_creates_the_schema(since_home_dir: Path)
     sqlite3.connect(since_home_dir / "since.db").close()  # a file without any table
 
     with Store.open() as s:
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
         assert s.get_cursor("agent") == 0
         assert s.events_after(0) == []
 
@@ -154,12 +154,12 @@ def test_open_completes_a_database_that_has_meta_but_no_schema_version(
         con.close()
 
     with Store.open() as s:
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
         assert s.get_meta("daemon_pid") == "5"  # existing meta is kept
         assert s.list_source_states() == []  # the rest of the schema now exists
 
 
-# --- schema v1 -> v2 -------------------------------------------------------------------------
+# --- schema v1 / v2 -> v3 ---------------------------------------------------------------------
 
 # The v1 tables, as the v1 code created them: what a database written before page-structure
 # tracking (D18) contains.
@@ -255,24 +255,41 @@ def make_v1_database(home: Path) -> Path:
     return path
 
 
+def make_v2_database(home: Path) -> Path:
+    """A real v2 database: the v1 one plus the page-structure columns (D18), version marker 2."""
+    path = make_v1_database(home)
+    con = sqlite3.connect(path, isolation_level=None)
+    try:
+        con.execute("ALTER TABLE sources ADD COLUMN fingerprint TEXT")
+        con.execute("ALTER TABLE sources ADD COLUMN broken_json TEXT NOT NULL DEFAULT '[]'")
+        con.execute("UPDATE sources SET fingerprint = 'f0', broken_json = '[\"td.x\"]'")
+        con.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+    finally:
+        con.close()
+    return path
+
+
 def source_columns(store: Store) -> dict[str, sqlite3.Row]:
     return {row["name"]: row for row in raw(store, "PRAGMA table_info(sources)")}
 
 
-def test_a_fresh_database_has_the_v2_source_columns(store: Store) -> None:
+def test_a_fresh_database_has_the_source_columns_of_every_version(store: Store) -> None:
     columns = source_columns(store)
     assert columns["fingerprint"]["type"] == "TEXT" and columns["fingerprint"]["notnull"] == 0
     assert columns["broken_json"]["notnull"] == 1
     assert columns["broken_json"]["dflt_value"] == "'[]'"
+    assert columns["announced_error"]["type"] == "TEXT"  # v3 (D24 revised)
+    assert columns["announced_error"]["notnull"] == 0
+    assert columns["announced_error"]["dflt_value"] is None
 
 
 def test_open_migrates_a_v1_database_and_keeps_its_data(since_home_dir: Path) -> None:
     make_v1_database(since_home_dir)
 
     with Store.open() as s:
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
         assert s.get_meta("daemon_pid") == "5"
-        assert {"fingerprint", "broken_json"} <= set(source_columns(s))
+        assert {"fingerprint", "broken_json", "announced_error"} <= set(source_columns(s))
         assert s.get_source_state("portal") == SourceState(
             source_id="portal",
             type="dir",
@@ -289,6 +306,7 @@ def test_open_migrates_a_v1_database_and_keeps_its_data(since_home_dir: Path) ->
             record_count=1,
             fingerprint=None,
             broken=[],
+            announced_error=None,
         )
         assert raw(s, "SELECT broken_json FROM sources")[0][0] == "[]"  # the column default
         assert list(s.get_snapshot("portal")) == ["4500123"]
@@ -300,9 +318,58 @@ def test_open_migrates_a_v1_database_and_keeps_its_data(since_home_dir: Path) ->
         assert s.get_source_state("newer").broken == []  # type: ignore[union-attr]
 
     with Store.open() as s:  # reopening a migrated database changes nothing
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
         state = s.get_source_state("portal")
         assert state is not None and (state.fingerprint, state.broken) == ("f1", ["td.x"])
+
+
+def test_open_migrates_a_v2_database_and_keeps_its_data(since_home_dir: Path) -> None:
+    make_v2_database(since_home_dir)
+
+    with Store.open() as s:
+        assert s.get_meta("schema_version") == "3"
+        assert "announced_error" in source_columns(s)
+        state = s.get_source_state("portal")
+        assert state is not None
+        assert (state.fingerprint, state.broken) == ("f0", ["td.x"])  # v2 data survives
+        assert (state.in_error, state.last_error, state.announced_error) == (True, "boom", None)
+        assert list(s.get_snapshot("portal")) == ["4500123"]
+        assert s.get_cursor("agent") == 1
+        # usable right away, and the column can be cleared again
+        s.update_source_state("portal", announced_error="boom")
+        assert s.get_source_state("portal").announced_error == "boom"  # type: ignore[union-attr]
+        s.update_source_state("portal", announced_error=None)
+        assert s.get_source_state("portal").announced_error is None  # type: ignore[union-attr]
+
+    with Store.open() as s:  # reopening changes nothing
+        assert s.get_meta("schema_version") == "3"
+
+
+def test_migrating_a_v2_database_needs_the_write_lock_but_a_v3_one_does_not(
+    since_home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = make_v2_database(since_home_dir)
+    monkeypatch.setattr(store_mod, "BUSY_TIMEOUT_MS", 200)
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Store.open()  # the migration is a write
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    with Store.open() as s:  # the failed attempt left nothing half-migrated
+        assert s.get_meta("schema_version") == "3"
+        assert "announced_error" in source_columns(s)
+
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        with Store.open() as reader:  # current version: read-only fast path, no write lock
+            assert reader.get_source_state("portal") is not None
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
 
 
 def test_migrating_a_v1_database_needs_the_write_lock(
@@ -319,22 +386,23 @@ def test_migrating_a_v1_database_needs_the_write_lock(
         holder.execute("ROLLBACK")
         holder.close()
     with Store.open() as s:  # the failed attempt left nothing half-migrated
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
         assert "broken_json" in source_columns(s)
 
 
 def test_migration_of_a_database_that_already_has_the_columns_is_harmless(
     since_home_dir: Path,
 ) -> None:
-    with Store.open() as s:  # a v2 database whose version marker says v1
+    with Store.open() as s:  # a v3 database whose version marker says v1
         add_source(s, "docs")
-        s.update_source_state("docs", fingerprint="keep", broken=["a"])
+        s.update_source_state("docs", fingerprint="keep", broken=["a"], announced_error="e")
         s.set_meta("schema_version", "1")
 
     with Store.open() as s:
-        assert s.get_meta("schema_version") == "2"
+        assert s.get_meta("schema_version") == "3"
         state = s.get_source_state("docs")
         assert state is not None and (state.fingerprint, state.broken) == ("keep", ["a"])
+        assert state.announced_error == "e"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")

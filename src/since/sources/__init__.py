@@ -9,11 +9,12 @@ actually used.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from since.config import SourceConfig
-from since.model import Record
+from since.model import Record, Scalar
 
 
 class CollectError(Exception):
@@ -26,9 +27,19 @@ class LoginRequired(CollectError):
     """A collection failed for a reason only a human can fix: the login is gone or refused (web
     ``login expired``, imap ``login failed for <user>``, changedetection ``API key rejected``).
 
-    The runner always surfaces such a failure (D24): while the source is already in error, one
-    with a message that differs from the current ``last_error`` still appends a ``source_error``,
-    so an agent that saw "layout broken" learns that the cause is now "log in again"."""
+    The runner always surfaces such a failure (D24 revised): while the source is already in error,
+    one whose message differs from the last *announced* error still appends a ``source_error``, so
+    an agent that saw "layout broken" learns that the cause is now "log in again"; the same login
+    problem is announced once, however many other errors come in between.
+
+    ``hint`` says what the human has to do (web: ``run since login <id>``; imap / changedetection:
+    check the secret in the named env var). It is stored with the event and rendered after the
+    quoted message as ``; needs a human: <hint>``; Since writes it, so it is not quoted. Empty =
+    no hint."""
+
+    def __init__(self, message: str, hint: str = "") -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 @dataclass(frozen=True)
@@ -36,10 +47,25 @@ class Window:
     """How far back a source looks (D21): ``field`` names a record field holding an ISO UTC
     timestamp, ``start`` (ISO UTC string, parseable by ``timeutil.from_iso``) is the oldest
     moment still covered. A record that is absent from a result and dated before ``start`` has
-    aged out of the window rather than been removed at the source."""
+    aged out of the window rather than been removed at the source.
+
+    A window may differ per scope (D20/D21 revised, e.g. one start per imap folder):
+    ``scope_field`` names a record field, ``starts`` maps its values to an ISO UTC start that
+    replaces ``start`` for the records with that value. :meth:`start_for` picks the start of one
+    record; a record whose scope value is not in ``starts`` uses ``start``."""
 
     field: str
     start: str
+    scope_field: str | None = None
+    starts: Mapping[str, str] = field(default_factory=dict, hash=False)
+
+    def start_for(self, fields: Mapping[str, Scalar]) -> str:
+        """The start (ISO UTC string) that applies to a record with these ``fields``."""
+        if self.scope_field is not None:
+            value = fields.get(self.scope_field)
+            if isinstance(value, str) and value in self.starts:
+                return self.starts[value]
+        return self.start
 
 
 @dataclass(frozen=True)
@@ -56,8 +82,9 @@ class CollectOutput:
 
     ``fingerprint`` / ``broken`` (D18, web sources): a structural fingerprint of the page and the
     extractor selectors that matched nothing. ``None`` fingerprint = the source does not track
-    page structure (``broken`` is then ignored). A non-empty ``broken`` means the extraction is
-    not trustworthy: the runner never diffs such a result."""
+    page layout (no ``schema_changed`` for a layout-only change). A non-empty ``broken`` means the
+    extraction is not trustworthy and the runner never diffs such a result, whether or not there
+    is a fingerprint (D18 revised)."""
 
     records: list[Record]
     unavailable: list[str] = field(default_factory=list)

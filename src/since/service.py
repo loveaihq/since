@@ -38,6 +38,7 @@ from since.render import (
     change_text,
     event_body,
     evt_handle,
+    hint_text,
     rec_handle,
     record_label,
 )
@@ -176,7 +177,7 @@ def _event_lines(event: Event, key_label: str) -> list[str]:
         n = int(detail.get("record_count") or 0)
         return [f"baseline: {n} record{'' if n == 1 else 's'}"]
     if kind == KIND_SOURCE_ERROR:
-        return [f"error: {q(detail.get('error'), GET_CAP)}"]
+        return [f"error: {q(detail.get('error'), GET_CAP)}{hint_text(event, GET_CAP)}"]
     if kind == KIND_SOURCE_RECOVERED:
         since = _fmt_time(detail.get("error_since"))
         return [f"recovered; error since {since}: {q(detail.get('last_error'), GET_CAP)}"]

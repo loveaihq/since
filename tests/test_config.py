@@ -17,7 +17,13 @@ from since.config import (
     parse_config,
 )
 
-CREDENTIALS_MSG = "credentials must come from an env var (url_env) or OS keyring, never YAML"
+CREDENTIALS_MSG = (
+    "credentials must come from an env var (url_env / password_env / api_key_env) "
+    "or OS keyring, never YAML"
+)
+ENV_NAME_MSG = (
+    "must be the NAME of an environment variable (e.g. SINCE_IMAP_PASSWORD), not the secret itself"
+)
 
 # The example from CLAUDE.md "Config example".
 CLAUDE_MD_EXAMPLE = """\
@@ -321,6 +327,93 @@ def test_url_allowed_on_other_types():
 def test_url_env_is_fine_on_sql():
     src = parse_config({"sources": [{"id": "q", "type": "sql", "url_env": "MY_DB"}]}).sources[0]
     assert src.options == {"url_env": "MY_DB"}
+
+
+def test_the_credential_message_names_every_env_option():
+    # QA 9: an imap / changedetection user must not be sent to `url_env`
+    assert "url_env / password_env / api_key_env" in CREDENTIALS_MSG
+    with pytest.raises(ConfigError) as exc:
+        parse_config({"sources": [{"id": "m", "type": "imap", "password": "hunter2"}]})
+    assert str(exc.value).endswith(CREDENTIALS_MSG)
+
+
+# --- *_env options must be env var names (D31) -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source_type", "key", "name"),
+    [
+        ("sql", "url_env", "SINCE_PO_DB_URL"),
+        ("imap", "password_env", "SINCE_IMAP_PASSWORD"),
+        ("changedetection", "api_key_env", "CD_API_KEY"),
+        ("imap", "password_env", "_x"),
+        ("imap", "password_env", "a"),
+        ("imap", "password_env", "lower_and_UPPER_123"),
+    ],
+)
+def test_env_options_accept_variable_names(source_type, key, name):
+    src = {"id": "s", "type": source_type, key: name}
+    assert parse_config({"sources": [src]}).sources[0].options == {key: name}
+
+
+# What a human pastes when they misread "password_env": the secret itself. None of these may
+# appear in the error.
+PASTED_SECRETS = [
+    "p@ss w0rd!",
+    "hunter2 hunter2",
+    "postgresql+psycopg://user:pw@host/db",
+    "abcd efgh ijkl mnop",  # a Google app password, with its spaces
+    "1Password",  # starts with a digit
+    "with-dash",
+    "NAME\n",  # a trailing newline is not a name
+    "NAME\nsecond line",
+    "",
+    " ",
+    "naïve",  # ASCII letters only
+    "\u0663\u0662",  # Unicode digits are not [A-Za-z0-9_]
+    None,
+    5,
+    True,
+    ["A"],
+    {"a": "b"},
+]
+
+
+@pytest.mark.parametrize("secret", PASTED_SECRETS, ids=repr)
+@pytest.mark.parametrize(
+    ("source_type", "key"),
+    [("sql", "url_env"), ("imap", "password_env"), ("changedetection", "api_key_env")],
+)
+def test_env_options_reject_anything_that_is_not_a_variable_name(source_type, key, secret):
+    src = {"id": "s", "type": source_type, key: secret}
+
+    with pytest.raises(ConfigError) as exc:
+        parse_config({"sources": [src]})
+
+    assert str(exc.value) == f"source 's': key '{key}': {ENV_NAME_MSG}"
+    for part in ("p@ss", "hunter2", "pw@host", "abcd", "Password", "naïve", "second line"):
+        assert part not in str(exc.value)
+
+
+def test_env_check_applies_to_every_key_ending_in_env_whatever_the_type():
+    src = {"id": "w", "type": "web", "url": "https://x.invalid", "cookie_env": "not a name"}
+    with pytest.raises(ConfigError, match=r"source 'w': key 'cookie_env': must be the NAME"):
+        parse_config({"sources": [src]})
+    # a key that merely contains "env" is not an env option
+    ok = {"id": "w", "type": "web", "url": "https://x.invalid", "environment": "not a name"}
+    assert parse_config({"sources": [ok]}).sources[0].options["environment"] == "not a name"
+
+
+def test_the_pasted_secret_never_reaches_the_error_from_a_file(tmp_path):
+    secret = "S3cr3t-Value-With-Dashes"
+    path = write(
+        tmp_path,
+        f"sources:\n  - id: mail\n    type: imap\n    password_env: {secret}\n",
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(path)
+    assert secret not in str(exc.value)
+    assert "key 'password_env'" in str(exc.value) and ENV_NAME_MSG in str(exc.value)
 
 
 # --- highlight -------------------------------------------------------------------------------

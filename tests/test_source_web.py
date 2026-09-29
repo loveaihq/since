@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 from login_fake import FakeApi, FakeError
-from web_site import CHANNEL, ROWS, Site, orders_html
+from web_site import CHANNEL, LOGIN_HTML, ROWS, Site, orders_html
 
 from since.collect import CollectResult, register_sources, run_collection
 from since.config import Config, ConfigError, SourceConfig
@@ -35,6 +35,7 @@ from since.model import (
     KIND_REMOVED,
     KIND_SCHEMA_CHANGED,
     KIND_SOURCE_ERROR,
+    KIND_SOURCE_RECOVERED,
 )
 from since.paths import since_home
 from since.sources import CollectError, CollectOutput, LoginRequired
@@ -203,6 +204,9 @@ def test_validate_accepts_the_documented_config_without_io(
     "options",
     [
         with_path("extract.container", "table#orders"),
+        with_path("extract.optional", ["link"]),
+        with_path("extract.optional", ["status", "link"]),
+        with_path("extract.optional", []),
         good_options(login_detect={"selector": "form#login"}),
         good_options(wait_for="table#orders", timeout_s=1),
         good_options(timeout_s=300, fingerprint_depth=32, browser_channel="chrome"),
@@ -255,6 +259,14 @@ def test_validate_accepts_valid_options(options: dict[str, Any]) -> None:
         (with_path("extract.container", ""), "key 'extract.container'"),
         (with_path("extract.container", 7), "key 'extract.container'"),
         (with_path("extract.foo", 1), "key 'extract.foo'"),
+        (with_path("extract.optional", "link"), "key 'extract.optional'"),
+        (with_path("extract.optional", None), "key 'extract.optional'"),
+        (with_path("extract.optional", {"link": True}), "key 'extract.optional'"),
+        (with_path("extract.optional", [5]), "key 'extract.optional'"),
+        (with_path("extract.optional", ["nope"]), "key 'extract.optional'"),
+        (with_path("extract.optional", ["link", "nope"]), "'nope' is not one of"),
+        (with_path("extract.optional", ["po"]), "the key field 'po' cannot be optional"),
+        (with_path("extract.optional", ["link", "po"]), "cannot be optional"),
         (good_options(wait_for=""), "key 'wait_for'"),
         (good_options(wait_for=5), "key 'wait_for'"),
         (good_options(timeout_s=0), "key 'timeout_s'"),
@@ -277,6 +289,16 @@ def test_validate_rejects_bad_options(options: dict[str, Any], fragment: str) ->
         WebCollector().validate(cfg)
     assert f"source '{SOURCE_ID}'" in str(info.value)
     assert fragment in str(info.value)
+
+
+def test_optional_fields_are_parsed_and_default_to_none() -> None:
+    assert _parse_options(make_cfg()).optional == frozenset()
+    opts = _parse_options(make_cfg(extract=extract_with(optional=["link", "status", "link"])))
+    assert opts.optional == frozenset({"link", "status"})
+
+
+def test_the_login_hint_names_the_source() -> None:
+    assert _parse_options(make_cfg()).login_hint == f"run since login {SOURCE_ID}"
 
 
 def test_a_relative_profile_dir_is_rejected_and_an_absolute_one_kept(tmp_path: Path) -> None:
@@ -366,6 +388,60 @@ def test_interpret_skips_rows_with_an_empty_key() -> None:
     out = interpret(raw_result(row_count=3, rows=rows))
     assert [r.key for r in out.records] == ["4500123"]
     assert out.broken == []  # the selectors work; the rows are just not records
+
+
+def test_interpret_key_selector_is_broken_when_no_row_has_a_key() -> None:
+    # D18 revised (QA 3): the portal added a checkbox column in front of the key column, so the
+    # key selector now reads empty cells: without this every stored record would go `removed`
+    rows = [["", "Open", "/a"], ["  ", "Shipped", ""]]
+
+    out = interpret(raw_result(row_count=2, rows=rows))
+
+    assert out.records == []
+    assert out.broken == ["td:nth-child(1)"]
+
+
+def test_interpret_lists_the_key_selector_in_field_order_and_only_once() -> None:
+    rows = [["", "", ""], ["", "", ""]]
+    out = interpret(raw_result(row_count=2, rows=rows, field_matched=[True, False, True]))
+    assert out.broken == ["td:nth-child(1)", "td:nth-child(4)"]  # key first: field order
+    # the key selector matching in no row is one report, not two
+    out = interpret(raw_result(row_count=2, rows=rows, field_matched=[False, True, True]))
+    assert out.broken == ["td:nth-child(1)"]
+
+
+def test_interpret_a_single_row_with_a_key_keeps_the_key_selector_working() -> None:
+    # header/total/spacer rows have no key and are skipped; one real row is proof enough
+    rows = [["", "x", ""], ["", "y", ""], ["4500123", "Open", ""]]
+    out = interpret(raw_result(row_count=3, rows=rows))
+    assert [r.key for r in out.records] == ["4500123"] and out.broken == []
+
+
+def test_interpret_no_rows_is_not_a_key_problem() -> None:
+    empty = raw_result(
+        container_found=True, row_count=0, rows=[], field_matched=[False, False, False]
+    )
+    assert interpret(empty, container="table#orders").broken == []  # a valid empty table
+    assert interpret(empty).broken == [SELECTOR_ROWS]  # only the rows selector is reported
+
+
+def test_interpret_optional_fields_may_match_in_no_row() -> None:
+    dead_link = raw_result(field_matched=[True, True, False])
+    assert interpret(dead_link).broken == ["td:nth-child(2) a"]
+    assert interpret(dead_link, optional=frozenset({"link"})).broken == []
+    both = raw_result(field_matched=[True, False, False])
+    assert interpret(both, optional=frozenset({"link"})).broken == ["td:nth-child(4)"]
+    assert interpret(both, optional=frozenset({"link", "status"})).broken == []
+
+
+def test_interpret_optional_does_not_exempt_the_key_field() -> None:
+    # validation refuses `key` in `optional`; even if it got here, an empty key stays broken
+    rows = [["", "Open", ""], ["", "Open", ""]]
+    out = interpret(
+        raw_result(row_count=2, rows=rows, field_matched=[False, True, True]),
+        optional=frozenset({"po"}),
+    )
+    assert out.broken == ["td:nth-child(1)"]
 
 
 def test_fingerprint_depth_zero_means_no_fingerprint() -> None:
@@ -764,6 +840,7 @@ def test_every_login_detect_path_raises_login_required(
             with pytest.raises(LoginRequired) as info:
                 WebCollector().collect(replace_options(make_cfg(), **changes))
             assert str(info.value) == "login expired", name
+            assert info.value.hint == f"run since login {SOURCE_ID}", name  # what a human does
             assert isinstance(info.value, CollectError), name
             assert (rig.context.closed, rig.stopped) == (1, 1), name
 
@@ -1049,6 +1126,118 @@ def test_a_field_selector_matching_nowhere_fails_the_first_run(site: Site, store
     assert kinds(store) == [KIND_SOURCE_ERROR]
 
 
+def with_checkbox_column(rows: list[tuple[str, str, str]]) -> str:
+    """The orders page after the portal put a checkbox column in front of the PO column."""
+    body = "".join(
+        f'<tr><td><input type="checkbox"></td><td>{po}</td><td>{item}</td><td>10</td>'
+        f"<td>{status}</td></tr>"
+        for po, item, status in rows
+    )
+    return (
+        '<table id="orders"><thead><tr><th></th><th>PO</th><th>Item</th><th>Qty</th>'
+        f"<th>Status</th></tr></thead><tbody>{body}</tbody></table>"
+    )
+
+
+def test_a_new_checkbox_column_is_schema_changed_and_removes_nothing(
+    site: Site, store: Store
+) -> None:
+    # QA 3: every row's key is now empty (the checkbox cell); this used to skip every row, so
+    # every record was `removed` and no schema_changed was raised
+    site.write("orders.html", orders_html(ROWS))
+    cfg = make_cfg(site.url())
+    assert run(store, cfg, 0).error is None
+    site.write("orders.html", with_checkbox_column(ROWS))
+
+    result = run(store, cfg, 1)
+
+    assert result.error is not None and "match 0 elements" in result.error
+    assert kinds(store) == [KIND_BASELINE, KIND_SCHEMA_CHANGED]  # no removed events
+    assert "td:nth-child(1)" in events(store)[1].detail["selectors"]  # the key selector
+    state = store.get_source_state(SOURCE_ID)
+    assert state is not None and state.in_error and state.record_count == 3
+    assert len(store.get_snapshot(SOURCE_ID)) == 3
+
+    # the old layout comes back: just a recovery, nothing modified or removed
+    site.write("orders.html", orders_html(ROWS))
+    assert run(store, cfg, 2).error is None
+    assert kinds(store) == [KIND_BASELINE, KIND_SCHEMA_CHANGED, KIND_SOURCE_RECOVERED]
+
+
+def test_an_optional_column_that_is_empty_everywhere_does_not_freeze_the_source(
+    site: Site, store: Store
+) -> None:
+    # QA 3: a genuinely optional column (here the link) that happens to be empty in every row
+    no_links = [("4500123", "", "Open"), ("4500124", "", "Open")]
+    site.write("orders.html", orders_html(no_links))
+
+    strict = run(store, make_cfg(site.url()), 0)
+    assert strict.error == 'extractor selector(s) match 0 elements: "td:nth-child(2) a"'
+    assert kinds(store) == [KIND_SOURCE_ERROR]  # without `optional` the source cannot baseline
+
+    cfg = make_cfg(site.url(), extract=extract_with(optional=["link"]))
+    assert run(store, cfg, 1).error is None
+    state = store.get_source_state(SOURCE_ID)
+    assert state is not None and state.baselined and state.broken == [] and not state.in_error
+
+    # a link appears on one row: an ordinary modification, not a layout problem
+    site.write("orders.html", orders_html([("4500123", "Widget", "Open"), no_links[1]]))
+    assert run(store, cfg, 2).error is None
+    assert keyed(store, KIND_MODIFIED) == {"4500123"}
+    [modified] = [e for e in events(store) if e.kind == KIND_MODIFIED]
+    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [
+        ("link", "", "/po/4500123")
+    ]
+
+
+def test_a_login_page_without_login_detect_is_not_a_baseline_of_zero_records(
+    site: Site, store: Store
+) -> None:
+    # QA 2, with the fingerprint switched off: the rows selector matches nothing on the login page
+    site.write("orders.html", LOGIN_HTML)
+    cfg = make_cfg(site.url(), fingerprint_depth=0)
+
+    result = run(store, cfg, 0)
+
+    assert result.error == f'extractor selector(s) match 0 elements: "{SELECTOR_ROWS}"'
+    assert kinds(store) == [KIND_SOURCE_ERROR]
+    state = store.get_source_state(SOURCE_ID)
+    assert state is not None and not state.baselined and state.fingerprint is None
+
+
+def test_a_layout_break_without_a_fingerprint_is_schema_changed_and_removes_nothing(
+    site: Site, store: Store
+) -> None:
+    # QA 2: `fingerprint_depth: 0` used to disable the broken-selector handling as well
+    site.write("orders.html", orders_html(ROWS))
+    cfg = make_cfg(site.url(), fingerprint_depth=0)
+    assert run(store, cfg, 0).error is None
+    site.write("orders.html", orders_html(ROWS, table_id="orders-v2"))
+
+    result = run(store, cfg, 1)
+
+    assert result.error is not None and "match 0 elements" in result.error
+    assert kinds(store) == [KIND_BASELINE, KIND_SCHEMA_CHANGED]
+    assert events(store)[1].detail == {"selectors": [SELECTOR_ROWS]}
+    state = store.get_source_state(SOURCE_ID)
+    assert state is not None and state.in_error and state.record_count == 3
+    assert state.fingerprint is None and state.broken == [SELECTOR_ROWS]
+    assert len(store.get_snapshot(SOURCE_ID)) == 3
+
+
+def test_a_lost_login_stores_the_hint_and_announces_it_once(site: Site, store: Store) -> None:
+    site.write("orders.html", orders_html(ROWS))
+    cfg = make_cfg(site.url(), login_detect={"url_contains": "/login"})
+    assert run(store, cfg, 0).error is None
+    site.logged_in = False
+
+    run(store, cfg, 1)
+    run(store, cfg, 2)
+
+    [error] = [e for e in events(store) if e.kind == KIND_SOURCE_ERROR]
+    assert error.detail == {"error": "login expired", "hint": f"run since login {SOURCE_ID}"}
+
+
 @pytest.mark.parametrize(
     ("path", "changes", "expected"),
     [
@@ -1204,6 +1393,16 @@ def test_extraction_reads_text_attributes_and_reports_broken_selectors(browser: 
     # a key selector that never matches: every row is skipped, and the field is reported
     dead_key = browser.snap(html, fields=fields("po", po="td.nope", status="td:nth-child(4)"))
     assert dead_key.records == [] and dead_key.broken == ["td.nope"]
+
+    # a key selector that matches but reads empty cells (a checkbox column): reported too
+    checkbox = browser.snap(with_checkbox_column(ROWS))
+    assert checkbox.records == [] and "td:nth-child(1)" in checkbox.broken
+
+    # optional fields may match in no row; the others still count
+    no_links = orders_html([("4500123", "", "Open"), ("4500124", "", "Open")])
+    assert browser.snap(no_links).broken == ["td:nth-child(2) a"]
+    optional = frozenset({"link"})
+    assert browser.snap(no_links, optional=optional).broken == []
 
     # an invalid CSS selector is a collect error naming it
     with pytest.raises(CollectError) as info:

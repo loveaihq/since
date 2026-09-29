@@ -6,6 +6,11 @@ expired data at most hourly. ``Daemon.run`` loops over ``tick`` (or, with ``once
 source once and leaves its heartbeat behind, D16). The clock and the sleep function are
 injected so tests never wait. Nothing here calls an LLM.
 
+Only one daemon may run per database (D30): ``start`` takes an exclusive, non-blocking OS lock on
+``daemon.lock`` next to the database and holds it until ``close`` (``run`` calls it), or until the
+process ends, however it ends. A second daemon, or ``--once`` while a daemon runs, fails with
+``DaemonError("another daemon is running")``. The heartbeat is only for staleness reporting.
+
 Meta keys owned by the daemon: ``daemon_pid``, ``daemon_heartbeat_at``, ``daemon_min_schedule_s``
 (read by ``since status`` / the digest header to judge whether the heartbeat is stale) and, via
 ``Store.prune``, ``last_pruned_at``.
@@ -13,13 +18,15 @@ Meta keys owned by the daemon: ``daemon_pid``, ``daemon_heartbeat_at``, ``daemon
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import signal
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import FrameType
 from typing import TextIO
 
@@ -35,8 +42,9 @@ META_MIN_SCHEDULE = "daemon_min_schedule_s"
 META_LAST_PRUNED = "last_pruned_at"
 
 MAX_SLEEP_S = 5  # upper bound of one sleep between ticks
-REFUSE_WINDOW_S = 30  # another daemon's heartbeat younger than this blocks start()
 PRUNE_INTERVAL_S = 3600
+LOCK_FILENAME = "daemon.lock"
+ANOTHER_DAEMON = "another daemon is running"
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]+")
 
@@ -46,6 +54,77 @@ SleepFn = Callable[[float], None]
 
 class DaemonError(Exception):
     """The daemon cannot start (e.g. another daemon is already running)."""
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_file(fd: int) -> None:
+        """Exclusive, non-blocking lock on the first byte (also works past the end of an empty
+        file). The lock belongs to the handle, so a second open of the file in this process
+        fails just like one from another process."""
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _unlock_file(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock_file(fd: int) -> None:
+        """``flock``, not ``lockf``: the lock belongs to the open file description, so a second
+        open of the file in this process fails too (POSIX ``lockf`` locks are per process)."""
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_file(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+# What a lock that is simply taken raises (Windows: EACCES; POSIX: EWOULDBLOCK / EAGAIN).
+_LOCK_TAKEN = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK})
+
+
+class _DaemonLock:
+    """The exclusive lock on ``daemon.lock``. The file stays empty and is never deleted (deleting
+    it would let two daemons lock two different files). The descriptor is not inheritable, so a
+    browser or other child process the daemon starts never keeps the lock alive."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._fd: int | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._fd is not None
+
+    def acquire(self) -> None:
+        """Take the lock (a no-op if this object already holds it). ``DaemonError`` if another
+        daemon holds it, or the lock file cannot be used."""
+        if self._fd is not None:
+            return
+        try:
+            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise DaemonError(f"cannot open {self._path}: {exc.strerror or exc}") from None
+        try:
+            _lock_file(fd)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in _LOCK_TAKEN:
+                raise DaemonError(ANOTHER_DAEMON) from None
+            raise DaemonError(f"cannot lock {self._path}: {exc.strerror or exc}") from None
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        with suppress(OSError):
+            _unlock_file(fd)
+        with suppress(OSError):
+            os.close(fd)
 
 
 def _one_line(text: str) -> str:
@@ -100,6 +179,7 @@ class Daemon:
         self._log: TextIO = sys.stderr if log is None else log
         self._pid = os.getpid() if pid is None else pid
         self._collectable: list[tuple[SourceConfig, Collector]] | None = None
+        self._lock = _DaemonLock(store.path.parent / LOCK_FILENAME)
         # In-memory back-off for runs that raised out of run_collection (a store error): nothing
         # was written, so the stored state would call the source due again on the very next tick.
         self._retry_at: dict[str, datetime] = {}
@@ -107,22 +187,28 @@ class Daemon:
     # -- lifecycle ---------------------------------------------------------------------------
 
     def start(self) -> None:
-        """Register the sources and announce this daemon (pid, shortest schedule, heartbeat).
+        """Take the daemon lock, register the sources and announce this daemon (pid, shortest
+        schedule, heartbeat).
 
-        Raises :class:`DaemonError` if another pid's heartbeat is younger than 30 seconds; in
-        that case nothing is written. Sources whose type has no collector yet are skipped with a
-        warning on the log."""
-        now = self._now_fn()
-        with self._store.transaction():  # check-and-claim is atomic against a racing daemon
-            self._refuse_if_other_daemon(now)
-            registration = register_sources(self._store, self._config, self._collectors)
-            collectable = sorted(registration.collectable, key=lambda item: item[0].id)
-            self._store.set_meta(META_PID, self._pid)
-            self._store.set_meta(
-                META_MIN_SCHEDULE,
-                min((cfg.schedule_s for cfg, _ in collectable), default=None),
-            )
-            self._store.set_meta(META_HEARTBEAT, to_iso(now))
+        Raises :class:`DaemonError` (``another daemon is running``) if another daemon holds the
+        lock; in that case nothing is written. The lock is released again if the start fails
+        otherwise, and by :meth:`close`. Sources whose type has no collector yet are skipped with
+        a warning on the log."""
+        self._lock.acquire()
+        try:
+            now = self._now_fn()
+            with self._store.transaction():
+                registration = register_sources(self._store, self._config, self._collectors)
+                collectable = sorted(registration.collectable, key=lambda item: item[0].id)
+                self._store.set_meta(META_PID, self._pid)
+                self._store.set_meta(
+                    META_MIN_SCHEDULE,
+                    min((cfg.schedule_s for cfg, _ in collectable), default=None),
+                )
+                self._store.set_meta(META_HEARTBEAT, to_iso(now))
+        except BaseException:
+            self._lock.release()
+            raise
         self._collectable = collectable
         self._retry_at.clear()
         for source_id, reason in registration.skipped:
@@ -130,26 +216,15 @@ class Daemon:
         if not collectable:
             self._warn("no collectable sources configured; only the heartbeat will be written")
 
-    def _refuse_if_other_daemon(self, now: datetime) -> None:
-        other = self._store.get_meta(META_PID)
-        if other is None or other == str(self._pid):
-            return
-        heartbeat = self._store.get_meta(META_HEARTBEAT)
-        if heartbeat is None:
-            return
-        try:
-            age = (now - from_iso(heartbeat)).total_seconds()
-        except ValueError:
-            return  # unreadable heartbeat: treat as stale
-        if abs(age) < REFUSE_WINDOW_S:
-            raise DaemonError(
-                f"another daemon is running (pid {other}, heartbeat {max(0, int(age))}s ago)"
-            )
+    def close(self) -> None:
+        """Release the daemon lock (idempotent). The meta is not touched; ``run`` clears it."""
+        self._lock.release()
 
     def run(self, once: bool = False) -> int:
         """Start, then serve until stopped (Ctrl-C, or SIGTERM on POSIX). ``once=True`` runs every
         source a single time regardless of schedule and returns. Always returns 0 after a stop;
-        errors other than a stop request propagate (after the cleanup)."""
+        errors other than a stop request propagate (after the cleanup, which also releases the
+        daemon lock)."""
         try:
             with _sigterm_ends_loop():
                 self.start()
@@ -160,7 +235,11 @@ class Daemon:
         except KeyboardInterrupt:
             pass
         finally:
-            self._clear_meta(keep_heartbeat=once)
+            try:
+                if self._lock.held:  # a daemon that never got the lock has claimed nothing
+                    self._clear_meta(keep_heartbeat=once)
+            finally:
+                self.close()
         return 0
 
     def _run_once(self) -> None:
@@ -175,9 +254,9 @@ class Daemon:
 
     def _clear_meta(self, keep_heartbeat: bool = False) -> None:
         """Remove our pid and, unless ``keep_heartbeat``, our heartbeat. Left alone if another
-        daemon owns the meta now (e.g. it took over after this process was suspended) or if
-        start() never claimed it. ``--once`` keeps its heartbeat (D16), so a scheduled run is
-        judged by the normal staleness rule instead of always being "not running"."""
+        daemon owns the meta now or if start() never claimed it. ``--once`` keeps its heartbeat
+        (D16), so a scheduled run is judged by the normal staleness rule instead of always being
+        "not running"."""
         with self._store.transaction():
             if self._store.get_meta(META_PID) == str(self._pid):
                 if not keep_heartbeat:

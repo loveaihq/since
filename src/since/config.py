@@ -1,10 +1,12 @@
 """Human-edited YAML config (``~/.since/since.yaml``): loading and validation.
 
-Credentials never live in YAML: sources reference an env var (``url_env``) instead.
+Credentials never live in YAML: sources reference an env var (``url_env`` / ``password_env`` /
+``api_key_env``) instead.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,7 +31,17 @@ DEFAULT_RETENTION_DAYS = 30
 HIGHLIGHT_OPS = ("equals", "contains", "changed_to")
 
 _CREDENTIAL_KEYS = frozenset({"password", "passwd", "secret", "token", "api_key"})
-_CREDENTIAL_MSG = "credentials must come from an env var (url_env) or OS keyring, never YAML"
+_CREDENTIAL_MSG = (
+    "credentials must come from an env var (url_env / password_env / api_key_env) "
+    "or OS keyring, never YAML"
+)
+
+# A source option whose key ends in ``_env`` names an environment variable (D31). What a human
+# pasted there instead (the secret itself) must never be echoed into an error, the DB or a digest.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ENV_NAME_MSG = (
+    "must be the NAME of an environment variable (e.g. SINCE_IMAP_PASSWORD), not the secret itself"
+)
 
 # Source keys consumed by the core; everything else lands in ``SourceConfig.options``.
 _CORE_KEYS = frozenset(
@@ -132,6 +144,14 @@ def _parse_source(index: int, raw: Any, seen_ids: set[str]) -> SourceConfig:
 
     if stype not in SOURCE_TYPES:
         raise _err(where, "type", f"must be one of {', '.join(SOURCE_TYPES)} (got {stype!r})")
+
+    for key, value in raw.items():
+        # fullmatch, not ``$`` (which lets a trailing newline through); the message never
+        # contains ``value``.
+        if key.lower().endswith("_env") and not (
+            isinstance(value, str) and _ENV_NAME_RE.fullmatch(value)
+        ):
+            raise _err(where, key, _ENV_NAME_MSG)
 
     priority = raw.get("priority", PRIORITY_NORMAL)
     if priority not in PRIORITIES:

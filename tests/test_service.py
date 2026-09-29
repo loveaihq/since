@@ -353,6 +353,55 @@ def test_since_marks_a_resolved_source_error_but_get_views_do_not(
     assert "(recovered)" not in batch
 
 
+def test_since_ranks_a_resolved_error_low_but_get_shows_the_stored_importance(
+    store: Store, svc: Service, clock: Clock
+) -> None:
+    # D28: effective importance = priority weight x recovered weight, only for the ranking
+    cfg, fake = make_cfg("docs", "high"), FakeCollector()
+    collect(store, cfg, fake, [rec("a", size=1)], T0)  # 1 baseline (3)
+    collect(store, cfg, fake, RuntimeError("disk gone"), T0 + timedelta(minutes=1))  # 2 error (15)
+    collect(store, cfg, fake, [rec("a", size=1)], T0 + timedelta(minutes=2))  # 3 recovered (3)
+    collect(store, cfg, fake, [rec("a", size=1), rec("b", size=1)], T0 + timedelta(minutes=3))  # 4
+    beat(store, clock)
+
+    lines = svc.since().splitlines()
+    order = [line.rsplit("/", 1)[1] for line in lines if line.startswith("  ")]
+    assert order == ["4", "1", "2", "3"]  # the added mail (9) first; the resolved error (3) by seq
+    assert svc.get("since://evt/2").splitlines()[0].split(" · ")[3] == "importance 15"
+    stored = store.get_event(2)
+    assert stored is not None and stored.importance == 15  # the stored value is never rewritten
+
+
+def test_since_marks_a_resolved_selector_schema_changed_but_not_a_layout_change(
+    store: Store, svc: Service, clock: Clock
+) -> None:
+    add_source(store, "sps-portal", "high", "web")
+    add_event(
+        store,
+        "sps-portal",
+        KIND_SCHEMA_CHANGED,
+        detail={"selectors": ["table#orders tbody tr"]},
+        importance=15,
+    )
+    add_event(store, "sps-portal", KIND_SOURCE_RECOVERED, importance=3)
+    add_event(store, "sps-portal", KIND_SCHEMA_CHANGED, detail={"selectors": []}, importance=15)
+    beat(store, clock)
+
+    lines = svc.since().splitlines()
+
+    assert lines[2:-1] == [
+        "[high] sps-portal (3)",
+        "  ! schema_changed: page layout changed; extractor selectors still match  since://evt/3",
+        '  ! schema_changed: 1 extractor selector matches 0 elements ("table#orders tbody tr")'
+        " (recovered)  since://evt/1",
+        "  ^ source_recovered  since://evt/2",
+    ]
+    # get views know nothing of the recovery
+    assert "(recovered)" not in svc.get("since://evt/1")
+    batch = svc.get("since://batch/1-3?source=sps-portal")
+    assert "(recovered)" not in batch
+
+
 def test_since_recovered_marker_needs_the_recovery_after_the_cursor_and_after_the_error(
     store: Store, svc: Service, clock: Clock
 ) -> None:
@@ -804,6 +853,62 @@ def test_get_evt_source_error(store: Store, svc: Service) -> None:
         store, "docs", KIND_SOURCE_ERROR, detail={"error": 'boom "x"\\y'}, importance=10
     )
     assert svc.get(f"since://evt/{seq}").splitlines()[2:] == ['error: "boom \\"x\\"\\\\y"']
+
+
+def test_get_evt_source_error_with_a_hint_says_what_a_human_must_do(
+    store: Store, svc: Service
+) -> None:
+    add_source(store, "sps-portal", "high", "web")
+    seq = add_event(
+        store,
+        "sps-portal",
+        KIND_SOURCE_ERROR,
+        detail={"error": "login expired", "hint": "run since login sps-portal"},
+        importance=15,
+    )
+    assert svc.get(f"since://evt/{seq}").splitlines()[2:] == [
+        'error: "login expired"; needs a human: run since login sps-portal'
+    ]
+    # the same text in the digest (and in a batch listing)
+    assert (
+        '  ! source_error: "login expired"; needs a human: run since login sps-portal'
+        f"  since://evt/{seq}" in svc.since().splitlines()
+    )
+    assert "needs a human: run since login sps-portal" in svc.get(f"since://batch/1-{seq}")
+
+
+def test_get_evt_source_error_hint_is_scrubbed_and_ignored_when_not_text(
+    store: Store, svc: Service
+) -> None:
+    add_source(store, "docs")
+    forged = add_event(
+        store, "docs", KIND_SOURCE_ERROR, detail={"error": "x", "hint": "a\nb"}, importance=10
+    )
+    odd = add_event(
+        store, "docs", KIND_SOURCE_ERROR, detail={"error": "x", "hint": {"a": 1}}, importance=10
+    )
+    assert svc.get(f"since://evt/{forged}").splitlines()[2:] == ['error: "x"; needs a human: a b']
+    assert svc.get(f"since://evt/{odd}").splitlines()[2:] == ['error: "x"']
+
+
+def test_get_shows_timestamp_title_values_compact(store: Store, svc: Service) -> None:
+    add_source(store, "inbox", "normal", "imap")
+    title = [
+        ["subject", "Re: DJ ASN rejection"],
+        ["from", "edi@supplier.example"],
+        ["received", "2026-09-29T09:12:05Z"],
+    ]
+    seq = add_event(
+        store, "inbox", KIND_ADDED, key="<m1@mail.example>", importance=6, detail={"title": title}
+    )
+    assert svc.get(f"since://evt/{seq}").splitlines()[2] == (
+        'record: "Re: DJ ASN rejection" from "edi@supplier.example" at 2026-09-29 09:12Z'
+        "  since://rec/inbox/%3Cm1%40mail.example%3E"
+    )
+    assert (
+        '  + "Re: DJ ASN rejection" from "edi@supplier.example" at 2026-09-29 09:12Z'
+        f"  since://evt/{seq}" in svc.since().splitlines()
+    )
 
 
 def test_get_evt_source_recovered(store: Store, svc: Service) -> None:

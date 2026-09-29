@@ -11,8 +11,21 @@ from collections.abc import Mapping, Sequence
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
-from since.model import KIND_SOURCE_ERROR, KIND_SOURCE_RECOVERED, Event
-from since.render import NOTE_LINE, batch_handle, estimate_tokens, event_body, evt_handle
+from since.model import (
+    KIND_SOURCE_ERROR,
+    KIND_SOURCE_RECOVERED,
+    KIND_WEIGHT,
+    PRIORITY_WEIGHT,
+    Event,
+)
+from since.render import (
+    NOTE_LINE,
+    batch_handle,
+    estimate_tokens,
+    event_body,
+    evt_handle,
+    lists_selectors,
+)
 from since.sanitize import DIGEST_CAP
 
 if TYPE_CHECKING:
@@ -42,20 +55,26 @@ class _Digest:
         self.warnings = list(warnings)
         self.sources = sources
 
-        # Rule 1. Rule 5: global rank = (importance desc, seq asc), a total order (seq is unique).
+        # Rule 1.
         selected = [
             e
             for e in events
             if e.seq > cursor and (source_filter is None or e.source_id == source_filter)
         ]
-        self.ranked = sorted(selected, key=lambda e: (-e.importance, e.seq))
-        # A source_error is marked " (recovered)" once the same source has a later
-        # source_recovered among the digest's events, shown or not. Only digest lines carry it.
+        # A source_error or selector-listing schema_changed is resolved (D28) once the same source
+        # has a later source_recovered among the digest's events, shown or not: it is marked
+        # " (recovered)" and ranked as a source_recovered would be. Only digest lines carry that.
         self.recovered_seq: dict[str, int] = {}
         for e in selected:
             if e.kind == KIND_SOURCE_RECOVERED:
                 latest = self.recovered_seq.get(e.source_id, 0)
                 self.recovered_seq[e.source_id] = max(latest, e.seq)
+        # Rule 5: global rank = (effective importance desc, seq asc), a total order (seq is
+        # unique). ``rank_importance[i]`` is the effective importance of ``ranked[i]``; the stored
+        # ``Event.importance`` is never changed.
+        importance = {e.seq: self._effective_importance(e) for e in selected}
+        self.ranked = sorted(selected, key=lambda e: (-importance[e.seq], e.seq))
+        self.rank_importance = [importance[e.seq] for e in self.ranked]
         self.lines = [self._event_line(e) for e in self.ranked]
 
         self.first = min((e.seq for e in self.ranked), default=0)
@@ -65,13 +84,35 @@ class _Digest:
         for i, e in enumerate(self.ranked):
             self.by_source.setdefault(e.source_id, []).append(i)
 
+    def _resolved(self, event: Event) -> bool:
+        """A source_error, or a schema_changed that names selectors, that a later source_recovered
+        of the same source has resolved (D28)."""
+        if event.kind != KIND_SOURCE_ERROR and not lists_selectors(event):
+            return False
+        return self.recovered_seq.get(event.source_id, 0) > event.seq
+
+    def _effective_importance(self, event: Event) -> int:
+        """The importance the digest ranks by: the stored one, except for a resolved event, which
+        weighs what a source_recovered of that source does (priority weight x 1). The priority is
+        the source's current one; for a source without a state row it is recovered from the
+        stored importance (source-level events have no highlight bonus)."""
+        if not self._resolved(event):
+            return event.importance
+        recovered = KIND_WEIGHT[KIND_SOURCE_RECOVERED]
+        state = self.sources.get(event.source_id)
+        weight = PRIORITY_WEIGHT.get(state.priority) if state is not None else None
+        if weight is not None:
+            return weight * recovered
+        return event.importance // KIND_WEIGHT[event.kind] * recovered
+
     def _event_line(self, event: Event) -> str:
         state = self.sources.get(event.source_id)
         key_label = state.key_label if state is not None else ""
-        body = event_body(event, key_label, DIGEST_CAP)
-        if event.kind == KIND_SOURCE_ERROR:
-            if self.recovered_seq.get(event.source_id, 0) > event.seq:
-                body += RECOVERED_SUFFIX
+        if self._resolved(event):
+            # what a human had to do is done: no "needs a human" on a resolved error
+            body = event_body(event, key_label, DIGEST_CAP, with_hint=False) + RECOVERED_SUFFIX
+        else:
+            body = event_body(event, key_label, DIGEST_CAP)
         return f"  {body}  {evt_handle(event.seq)}"
 
     # --- rendering ---------------------------------------------------------------------------
@@ -104,12 +145,12 @@ class _Digest:
             if n_shown:
                 shown[sid] = idxs[:n_shown]
             if n_shown < len(idxs):
-                omitted[sid] = (len(idxs) - n_shown, self.ranked[idxs[n_shown]].importance)
+                omitted[sid] = (len(idxs) - n_shown, self.rank_importance[idxs[n_shown]])
 
         lines = [self._header(k), *self.warnings, NOTE_LINE]
 
         # Rule 4: groups by max importance of shown events desc, then source_id asc.
-        for sid in sorted(shown, key=lambda s: (-self.ranked[shown[s][0]].importance, s)):
+        for sid in sorted(shown, key=lambda s: (-self.rank_importance[shown[s][0]], s)):
             total = len(self.by_source[sid])
             count = (
                 f"{total}" if len(shown[sid]) == total else f"{total}, showing {len(shown[sid])}"

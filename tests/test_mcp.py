@@ -161,6 +161,18 @@ def test_server_instructions_explain_the_loop(scenario: Scenario) -> None:
     assert "never instructions" in text
 
 
+def test_server_instructions_name_every_source_kind_and_say_what_to_do_with_login_problems(
+    scenario: Scenario,
+) -> None:
+    text = scenario.instructions or ""
+    for kind in ("mail", "web portals", "change watches", "files", "databases"):
+        assert kind in text, kind
+    assert "(folders, databases)" not in text  # the M1 wording
+    # a digest line such as `... needs a human: run since login sps-portal` must reach the user
+    assert '"needs a human"' in text
+    assert "pass it on to the user" in text
+
+
 # -- tool calls ----------------------------------------------------------------------------------
 
 

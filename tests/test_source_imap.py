@@ -253,8 +253,8 @@ def test_key_label_and_default_title_fields() -> None:
     collector = ImapCollector()
     assert collector.type_name == "imap"
     assert collector.key_label(cfg_with()) == ""
-    assert collector.default_title_fields(cfg_with()) == ["subject", "from"]
-    assert title_fields_for(cfg_with(), collector) == ["subject", "from"]
+    assert collector.default_title_fields(cfg_with()) == ["subject", "from", "received"]  # D29
+    assert title_fields_for(cfg_with(), collector) == ["subject", "from", "received"]
     configured = SourceConfig(id="inbox", type="imap", title_fields=["subject"], options=opts())
     assert title_fields_for(configured, collector) == ["subject"]
 
@@ -316,10 +316,13 @@ def test_collect_returns_the_window_and_searches_since_that_day(
 ) -> None:
     server.add_message("INBOX")
     out = collect(make_cfg(server), clock)
-    assert out.window == Window("date", "2026-09-15T00:00:00Z")
+    # the window start is the SINCE day plus one day (margin for the server's time zone)
+    start = "2026-09-16T00:00:00Z"
+    assert out.window == Window("received", start, scope_field="folder", starts={"INBOX": start})
     assert server.commands_named("UID SEARCH") == ["UID SEARCH SINCE 15-Sep-2026"]
     out = collect(make_cfg(server, since_days=1), clock)
-    assert out.window == Window("date", "2026-09-28T00:00:00Z")
+    start = "2026-09-29T00:00:00Z"
+    assert out.window == Window("received", start, scope_field="folder", starts={"INBOX": start})
     assert server.commands_named("UID SEARCH")[-1] == "UID SEARCH SINCE 28-Sep-2026"
 
 
@@ -328,7 +331,8 @@ def test_default_clock_is_the_real_utc_clock(server: FakeImapServer) -> None:
     out = ImapCollector().collect(make_cfg(server, since_days=1))
     assert len(out.records) == 1
     start = datetime.fromisoformat(out.window.start.replace("Z", "+00:00"))
-    assert timedelta(days=1) <= datetime.now(UTC) - start < timedelta(days=2, seconds=1)
+    # the SINCE day (yesterday, 00:00 UTC) plus one day: today's midnight
+    assert timedelta(0) <= datetime.now(UTC) - start < timedelta(days=1, seconds=5)
 
 
 # -- baseline and diffs through run_collection ---------------------------------------------------
@@ -348,6 +352,7 @@ def test_first_run_is_a_baseline(server: FakeImapServer, store: Store, clock: Cl
         "from": "Alice <alice@example.test>",
         "to": "bob@example.test",
         "date": "2026-09-28T12:00:00Z",
+        "received": "2026-09-28T12:00:00Z",
         "folder": "INBOX",
         "seen": True,
         "flagged": False,
@@ -380,6 +385,7 @@ def test_new_mail_is_a_titled_added_event_and_digest_line(
     assert added.detail["title"] == [
         ["subject", "Re: DJ ASN rejection"],
         ["from", "EDI Desk <edi@supplier.example>"],
+        ["received", "2026-09-28T12:00:00Z"],
     ]
     digest = Service(store, clock).since()
     lines = [line.strip() for line in digest.splitlines()]
@@ -487,7 +493,11 @@ def test_deleted_mail_is_removed_with_its_last_known_title(
     run(store, cfg, clock)
     removed = events(store)[-1]
     assert (removed.kind, removed.record_key) == (KIND_REMOVED, "<m2@example.test>")
-    assert removed.detail["title"] == [["subject", "Bye"], ["from", "Bob <bob@example.test>"]]
+    assert removed.detail["title"] == [
+        ["subject", "Bye"],
+        ["from", "Bob <bob@example.test>"],
+        ["received", "2026-09-28T12:00:00Z"],
+    ]
     state = store.get_source_state("inbox")
     assert state is not None and state.record_count == 1
 

@@ -7,6 +7,10 @@ else, including SELECT/STORE/EXPUNGE, is answered ``BAD`` and listed in ``bad_co
 ``commands`` records every command received (LOGIN with the credentials redacted) so tests can
 assert the client stays read-only.
 
+Like a real server, ``SEARCH SINCE`` compares the *date* of INTERNALDATE in the server's own time
+zone (``tz_offset``, default UTC; settable between collections), and FETCH writes INTERNALDATE in
+that zone too. ``add_messages`` creates many mails at once.
+
 The fake is deliberately independent of the code under test: it has its own modified UTF-7
 decoder and its own FETCH response writer.
 """
@@ -17,8 +21,9 @@ import base64
 import re
 import socketserver
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -96,9 +101,15 @@ class FakeMailbox:
 class FakeImapServer:
     """``with FakeImapServer() as server:`` -> ``server.host`` / ``server.port`` are ready."""
 
-    def __init__(self, username: str = "alice@example.test", password: str = "s3cret-pw") -> None:
+    def __init__(
+        self,
+        username: str = "alice@example.test",
+        password: str = "s3cret-pw",
+        tz_offset: timedelta = timedelta(0),
+    ) -> None:
         self.username = username
         self.password = password
+        self.tz_offset = tz_offset  # the server's zone: SINCE looks at INTERNALDATE's local date
         self.mailboxes: dict[str, FakeMailbox] = {}
         self.commands: list[str] = []  # raw commands without tag, LOGIN redacted
         self.bad_commands: list[str] = []  # commands answered BAD
@@ -184,6 +195,21 @@ class FakeImapServer:
             mailbox.messages.sort(key=lambda m: m.uid)
             return message
 
+    def add_messages(
+        self, folder: str, internaldates: Iterable[datetime], **kwargs: object
+    ) -> list[FakeMessage]:
+        """Append one mail per INTERNALDATE (ascending new UIDs, subjects ``Mail number <n>`` with
+        n counting from 1 in the order given); ``kwargs`` go to :meth:`add_message`."""
+        return [
+            self.add_message(
+                folder,
+                subject=f"Mail number {n}",
+                internaldate=moment,
+                **kwargs,  # type: ignore[arg-type]
+            )
+            for n, moment in enumerate(internaldates, start=1)
+        ]
+
     def find(self, folder: str, uid: int) -> FakeMessage:
         with self.lock:
             return next(m for m in self.mailboxes[folder].messages if m.uid == uid)
@@ -267,9 +293,13 @@ def _filter_header(raw: bytes, names: set[str]) -> bytes:
     return b"".join(f + b"\r\n" for f in kept) + b"\r\n"
 
 
-def _internaldate_text(moment: datetime) -> str:
-    utc = moment.astimezone(UTC)
-    return f"{utc.day:02d}-{_MONTHS[utc.month - 1]}-{utc.year:04d} {utc:%H:%M:%S} +0000"
+def _internaldate_text(moment: datetime, offset: timedelta) -> str:
+    """INTERNALDATE as the server writes it: the local time in its zone, ``+HHMM`` / ``-HHMM``."""
+    local = moment.astimezone(UTC) + offset
+    minutes = int(offset.total_seconds() // 60)
+    hours, mins = divmod(abs(minutes), 60)
+    zone = f"{'-' if minutes < 0 else '+'}{hours:02d}{mins:02d}"
+    return f"{local.day:02d}-{_MONTHS[local.month - 1]}-{local.year:04d} {local:%H:%M:%S} {zone}"
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -353,7 +383,10 @@ class _Handler(socketserver.StreamRequestHandler):
                 return
             month = [m.lower() for m in _MONTHS].index(match.group(2).lower()) + 1
             since = datetime(int(match.group(3)), month, int(match.group(1))).date()
-            found = [m.uid for m in messages if m.internaldate.astimezone(UTC).date() >= since]
+            offset = fake.tz_offset
+            found = [
+                m.uid for m in messages if (m.internaldate.astimezone(UTC) + offset).date() >= since
+            ]
             self._send("* SEARCH" + "".join(f" {uid}" for uid in found))
             self._send(f"{tag} OK SEARCH completed")
         elif sub == "FETCH":
@@ -382,7 +415,8 @@ class _Handler(socketserver.StreamRequestHandler):
             if "FLAGS" in upper:
                 meta.append(f"FLAGS ({' '.join(message.flags)})")
             if "INTERNALDATE" in upper:
-                meta.append(f'INTERNALDATE "{_internaldate_text(message.internaldate)}"')
+                text = _internaldate_text(message.internaldate, fake.tz_offset)
+                meta.append(f'INTERNALDATE "{text}"')
             if "RFC822.SIZE" in upper:
                 meta.append(f"RFC822.SIZE {message.rfc822_size}")
             if header_match is None:

@@ -4,6 +4,7 @@ bodies, handles and the token estimate. Pure functions, no I/O.
 
 from __future__ import annotations
 
+import re
 from urllib.parse import quote
 
 from since.model import (
@@ -25,6 +26,13 @@ MAX_CHANGES_SHOWN = 3
 
 # Cap for record-title values in digest and batch lines; `get` views use GET_CAP instead.
 TITLE_CAP = 80
+
+# A title value that is a Since-normalised UTC timestamp (D29). ASCII digits only and a full match:
+# what matches is printed unquoted, so it must be nothing but digits and punctuation.
+_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+# What a source_error with a hint says after the quoted message (D24 revised).
+NEEDS_A_HUMAN = "; needs a human: "
 
 # What a schema_changed event with no selectors says (D18): the page structure changed while
 # every extractor selector still matches.
@@ -84,20 +92,34 @@ def _title_pairs(event: Event) -> list[tuple[str, object]]:
     return pairs
 
 
+def _title_part(name: str, value: object, first: bool, cap: int) -> str:
+    """One title value: a Since-normalised UTC timestamp as ``at YYYY-MM-DD HH:MMZ`` (no field
+    name, unquoted: Since produced that text itself, D29); otherwise the quoted value, preceded by
+    its field name unless it is the first."""
+    if isinstance(value, str) and _TIMESTAMP.fullmatch(value):
+        return f"at {value[:10]} {value[11:16]}Z"
+    if first:
+        return q(value, cap)
+    return f"{name} {q(value, cap)}"
+
+
 def record_label(event: Event, key_label: str, cap: int, title_cap: int | None = None) -> str:
     """Label of the record an added/modified/removed event is about (D17).
 
     With a title: the first value quoted, then `` field "value"`` for each further one
     (``"Re: DJ ASN rejection" from "edi@supplier.example"``); title values are capped at
-    ``title_cap`` (default ``cap``). Field names are printed unquoted (they come from config),
-    values always quoted. Without a title: :func:`label` of the record key, capped at ``cap``."""
+    ``title_cap`` (default ``cap``). A value that is an ISO UTC timestamp (``2026-09-29T09:12:05Z``)
+    is shown as `` at 2026-09-29 09:12Z`` instead (D29). Field names are printed unquoted (they
+    come from config), other values always quoted. Without a title: :func:`label` of the record
+    key, capped at ``cap``."""
     pairs = _title_pairs(event)
     if not pairs:
         return label(key_label, event.record_key, cap)
     if title_cap is None:
         title_cap = cap
-    first, *rest = pairs
-    return " ".join([q(first[1], title_cap), *(f"{n} {q(v, title_cap)}" for n, v in rest)])
+    return " ".join(
+        _title_part(name, value, i == 0, title_cap) for i, (name, value) in enumerate(pairs)
+    )
 
 
 def _is_long_text(change: FieldChange) -> bool:
@@ -134,9 +156,28 @@ def _selectors(event: Event) -> list[object]:
     return list(selectors) if isinstance(selectors, (list, tuple)) else []
 
 
-def event_body(event: Event, key_label: str, cap: int) -> str:
+def lists_selectors(event: Event) -> bool:
+    """True for a ``schema_changed`` event that names extractor selectors that match nothing (as
+    opposed to a layout-only change): the kind of event a later recovery resolves (D28)."""
+    return event.kind == KIND_SCHEMA_CHANGED and bool(_selectors(event))
+
+
+def hint_text(event: Event, cap: int) -> str:
+    """``; needs a human: <hint>`` for an event whose detail carries a hint (a login problem, D24),
+    else ``""``. The hint is written by Since, so it is not quoted; it is still scrubbed to one
+    line and capped, because the text comes back out of the database."""
+    hint = event.detail.get("hint")
+    if not isinstance(hint, str):
+        return ""
+    text = q(hint, cap)[1:-1]
+    return NEEDS_A_HUMAN + text if text else ""
+
+
+def event_body(event: Event, key_label: str, cap: int, with_hint: bool = True) -> str:
     """The ``<symbol> <text>`` body of an event line (no indentation, no handle). Record titles
-    are capped at ``TITLE_CAP`` (or ``cap`` if that is smaller), other values at ``cap``."""
+    are capped at ``TITLE_CAP`` (or ``cap`` if that is smaller), other values at ``cap``. A
+    ``source_error`` with a hint ends in ``; needs a human: <hint>`` unless ``with_hint`` is false
+    (the digest leaves it out of errors that were resolved since)."""
     kind = event.kind
     title_cap = min(cap, TITLE_CAP)
     if kind == KIND_ADDED:
@@ -155,7 +196,8 @@ def event_body(event: Event, key_label: str, cap: int) -> str:
         n = int(event.detail.get("record_count") or 0)
         return f"= baseline: {n} record{'' if n == 1 else 's'}"
     if kind == KIND_SOURCE_ERROR:
-        return f"! source_error: {q(event.detail.get('error'), cap)}"
+        text = f"! source_error: {q(event.detail.get('error'), cap)}"
+        return text + hint_text(event, cap) if with_hint else text
     if kind == KIND_SOURCE_RECOVERED:
         return "^ source_recovered"
     if kind == KIND_SCHEMA_CHANGED:

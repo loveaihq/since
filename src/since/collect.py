@@ -186,10 +186,21 @@ def _check_unavailable(raw: Iterable[str], record_keys: set[str]) -> list[str]:
 
 
 class _Window(NamedTuple):
-    """A validated ``Window``: the field name and the parsed start."""
+    """A validated ``Window``: the field name, the parsed start and, for a window that differs per
+    scope, the scope field with the parsed start of each scope value."""
 
     field: str
     start: datetime
+    scope_field: str | None = None
+    starts: Mapping[str, datetime] = {}
+
+    def start_for(self, fields: Mapping[str, object]) -> datetime:
+        """The start that applies to a record with these ``fields`` (``Window.start_for``)."""
+        if self.scope_field is not None:
+            value = fields.get(self.scope_field)
+            if isinstance(value, str) and value in self.starts:
+                return self.starts[value]
+        return self.start
 
 
 @dataclass(frozen=True)
@@ -220,7 +231,25 @@ def _check_window(raw: object) -> _Window | None:
         raise CollectError(
             f"invalid window: start {q(raw.start, 64)} is not an ISO timestamp with a timezone"
         ) from None
-    return _Window(raw.field, start)
+    scope_field = raw.scope_field
+    if scope_field is not None and (not isinstance(scope_field, str) or not scope_field):
+        raise CollectError("invalid window: scope_field must be None or a non-empty string")
+    if not isinstance(raw.starts, Mapping):
+        raise CollectError("invalid window: starts must be a mapping of scope value to timestamp")
+    if raw.starts and scope_field is None:
+        raise CollectError("invalid window: starts needs a scope_field")
+    starts: dict[str, datetime] = {}
+    for scope, text in raw.starts.items():
+        if not isinstance(scope, str) or not isinstance(text, str):
+            raise CollectError("invalid window: starts must map strings to ISO timestamp strings")
+        try:
+            starts[scope] = from_iso(text)
+        except (ValueError, OverflowError):
+            raise CollectError(
+                f"invalid window: starts[{q(scope, 64)}] {q(text, 64)} "
+                "is not an ISO timestamp with a timezone"
+            ) from None
+    return _Window(raw.field, start, scope_field, starts)
 
 
 def _check_fingerprint(raw: object) -> str | None:
@@ -267,6 +296,15 @@ def _failure_message(exc: Exception) -> str:
     return _cap(message)
 
 
+def _failure_hint(exc: Exception) -> str:
+    """What a human has to do about a ``LoginRequired`` failure (its ``hint``); ``""`` for every
+    other failure."""
+    if not isinstance(exc, LoginRequired):
+        return ""
+    hint = getattr(exc, "hint", "")
+    return _cap(hint) if isinstance(hint, str) else ""
+
+
 # -- the run -------------------------------------------------------------------------------------
 
 
@@ -301,12 +339,13 @@ def run_collection(
     (D21) leave the snapshot without an event. Errors raised by the store itself are not source
     failures; they propagate after the rollback.
 
-    A collector that reports a page ``fingerprint`` (D18) also gets page-structure tracking: an
-    extraction whose selectors match nothing (``broken``) is never diffed (see
-    ``_store_success``), and a change of the fingerprint is reported as ``schema_changed``.
+    A collector that reports ``broken`` selectors (D18 revised) never has that result diffed, with
+    or without a page ``fingerprint`` (see ``_store_success``); one that reports a ``fingerprint``
+    also gets its layout changes reported as ``schema_changed``.
 
-    A ``LoginRequired`` failure (D24) is always surfaced: while the source is already in error, one
-    whose message differs from the current ``last_error`` still appends a ``source_error``.
+    A ``LoginRequired`` failure (D24 revised) is always surfaced: while the source is already in
+    error, one whose message differs from the last *announced* error (``announced_error``) still
+    appends a ``source_error``, carrying the exception's ``hint`` in ``detail["hint"]``.
 
     The diff is limited to ``track_fields_for(cfg, collector)`` (D26): the configured
     ``track_fields``, else the collector's default, else every field.
@@ -325,6 +364,7 @@ def run_collection(
             now,
             _failure_message(exc),
             login=isinstance(exc, LoginRequired),
+            hint=_failure_hint(exc),
         )
     return _store_success(store, cfg, collector, now, checked, title_fields, track_fields)
 
@@ -352,12 +392,13 @@ def _store_failure(
     message: str,
     *,
     login: bool = False,
+    hint: str = "",
 ) -> CollectResult:
     with store.transaction():
         state = _ensure_state(store, cfg, collector)
         if _superseded(state, now):
             return CollectResult(superseded=True)
-        return _apply_failure(store, cfg, state, now, message, login=login)
+        return _apply_failure(store, cfg, state, now, message, login=login, hint=hint)
 
 
 def _apply_failure(
@@ -368,26 +409,35 @@ def _apply_failure(
     message: str,
     *,
     login: bool = False,
+    hint: str = "",
 ) -> CollectResult:
     """Record a failed run (inside the run's transaction, after the staleness check): one
     ``source_error`` if the source was not in error yet, and always the latest message/time.
 
-    ``login`` (a ``LoginRequired`` failure, D24) also appends a ``source_error`` when the source
-    is already in error but for another reason (``last_error`` differs from ``message``): what a
-    human has to do changed, and the agent must learn it. ``error_since`` stays as it was."""
+    ``login`` (a ``LoginRequired`` failure, D24 revised) also appends a ``source_error`` when the
+    source is already in error but ``message`` differs from the last *announced* error
+    (``announced_error``, not ``last_error``: a plain failure in between overwrites ``last_error``
+    but announces nothing, so the same login problem is never announced twice): what a human has
+    to do changed, and the agent must learn it. ``hint`` (what the human has to do) is stored
+    with the event. Every appended ``source_error`` sets ``announced_error``; ``error_since``
+    stays as it was."""
     seqs: list[int] = []
     cols: dict[str, object] = {"last_error": message, "last_error_at": now}
-    announce = not state.in_error or (login and state.last_error != message)
+    announce = not state.in_error or (login and state.announced_error != message)
     if announce:
+        detail: dict[str, object] = {"error": message}
+        if hint:
+            detail["hint"] = hint
         seqs.append(
             store.append_event(
                 cfg.id,
                 KIND_SOURCE_ERROR,
                 now=now,
                 importance=_source_importance(cfg, KIND_SOURCE_ERROR),
-                detail={"error": message},
+                detail=detail,
             )
         )
+        cols["announced_error"] = message
     if not state.in_error:
         cols["in_error"] = True
         cols["error_since"] = now
@@ -414,8 +464,9 @@ def _apply_broken(
     wave of ``removed``. The source goes (or stays) in error with ``message``; the first
     ``schema_changed`` event comes instead of a ``source_error``, and another one only when the
     sorted ``broken`` selectors differ from the stored ones, so a lasting broken state is announced
-    once. The stored ``fingerprint`` is NOT touched (D25): it stays the last *good* one, so a page
-    that comes back unchanged recovers with just ``source_recovered``."""
+    once; the message it announces becomes ``announced_error`` (D24 revised). The stored
+    ``fingerprint`` is NOT touched (D25): it stays the last *good* one, so a page that comes back
+    unchanged recovers with just ``source_recovered``."""
     seqs: list[int] = []
     pair = sorted(checked.broken)
     cols: dict[str, object] = {
@@ -423,7 +474,8 @@ def _apply_broken(
         "last_error_at": now,
         "broken": pair,
     }
-    if pair != state.broken:
+    # re-announce when something else (e.g. a login problem) was announced since (D24)
+    if pair != state.broken or state.announced_error != message:
         seqs.append(
             store.append_event(
                 cfg.id,
@@ -433,6 +485,7 @@ def _apply_broken(
                 detail={"selectors": list(checked.broken)},
             )
         )
+        cols["announced_error"] = message
     if not state.in_error:
         cols["in_error"] = True
         cols["error_since"] = now
@@ -449,22 +502,26 @@ def _store_success(
     title_fields: list[str],
     track_fields: list[str] | None,
 ) -> CollectResult:
-    """Store a valid result. With a page fingerprint (D18):
+    """Store a valid result. Page structure (D18 revised):
 
     - broken selectors, not baselined yet: a run failure (a source that never worked must not
       baseline an empty page);
-    - broken selectors, baselined: :func:`_apply_broken`;
-    - no broken selectors: the fingerprint is stored (with ``broken`` cleared); if the stored
-      one (the last good one, D25) differed, a ``schema_changed`` with no selectors precedes the
-      normal diff."""
+    - broken selectors, baselined: :func:`_apply_broken`. Both hold whether or not the collector
+      reports a fingerprint;
+    - no broken selectors: ``broken`` is cleared; with a fingerprint it is stored, and if the
+      stored one (the last good one, D25) differed, a ``schema_changed`` with no selectors
+      precedes the normal diff.
+
+    A success that ends an error streak appends ``source_recovered`` and clears
+    ``announced_error``."""
     seqs: list[int] = []
     fingerprint = checked.fingerprint
     with store.transaction():
         state = _ensure_state(store, cfg, collector)
         if _superseded(state, now):
             return CollectResult(superseded=True)
-        if fingerprint is not None and checked.broken:
-            message = _broken_message(checked.broken)
+        if checked.broken:
+            message = _broken_message(sorted(checked.broken))
             if not state.baselined:
                 return _apply_failure(store, cfg, state, now, message)
             return _apply_broken(store, cfg, state, now, checked, message)
@@ -481,9 +538,10 @@ def _store_success(
             )
             cols["in_error"] = False
             cols["error_since"] = None
+            cols["announced_error"] = None
+        cols["broken"] = []  # whatever was broken is not any more (also without a fingerprint)
         if fingerprint is not None:
             cols["fingerprint"] = fingerprint
-            cols["broken"] = []
         if not state.baselined:
             store.put_records(cfg.id, checked.records, now)
             seqs.append(
@@ -536,9 +594,10 @@ def _aged_out(
     comparable: Mapping[str, Record], present: set[str], window: _Window | None
 ) -> set[str]:
     """Keys of ``comparable`` (the old records that take part in the diff) that are absent from
-    the new result (``present``) and dated before the window start (D21). The dates are compared
-    as parsed datetimes. A missing, non-str or unparseable value never ages a record out: it
-    stays an ordinary removal."""
+    the new result (``present``) and dated before the window start that applies to them (D21;
+    ``Window.start_for``: per scope when the window has one). The dates are compared as parsed
+    datetimes. A missing, non-str or unparseable value never ages a record out: it stays an
+    ordinary removal."""
     if window is None:
         return set()
     aged: set[str] = set()
@@ -552,7 +611,7 @@ def _aged_out(
             dated = from_iso(value)
         except (ValueError, OverflowError):
             continue
-        if dated < window.start:
+        if dated < window.start_for(record.fields):
             aged.add(key)
     return aged
 

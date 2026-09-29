@@ -53,14 +53,17 @@ sources:
 ```
 
 Credentials never go in the YAML: a `sql` source names an environment variable (`url_env`) that
-holds the connection URL, and the config loader rejects `password`, `token` and similar keys
-(and an inline `url` on `sql` sources). Set the variable in the environment of the process that collects, i.e. the daemon
+holds the connection URL (`imap` uses `password_env`, `changedetection` `api_key_env`), and the config
+loader rejects `password`, `token` and similar keys (and an inline `url` on `sql` sources). Every
+option whose name ends in `_env` must be the *name* of a variable (letters, digits and `_`, not
+starting with a digit); if you paste the secret itself there, the error says so without repeating it.
+Set the variable in the environment of the process that collects, i.e. the daemon
 (`export SINCE_PO_DB_URL=postgresql+psycopg://user:pw@host/db`, or `$env:SINCE_PO_DB_URL = "..."`
 in PowerShell). Highlight rules are `equals`, `contains` or `changed_to`.
 
 `title_fields` (any source, 1-3 field names) chooses what a record is called in digests. A Message-ID
-or a UUID means nothing to an agent, so `imap` defaults to `[subject, from]` and `changedetection`
-to `[title]`; for the others the quoted key is the label unless you set `title_fields`
+or a UUID means nothing to an agent, so `imap` defaults to `[subject, from, received]` and
+`changedetection` to `[title]`; for the others the quoted key is the label unless you set `title_fields`
 (`title_fields: [po, supplier]` prints `"4500123" supplier "ACME Ltd"`).
 
 ## Sources
@@ -83,13 +86,19 @@ sources:
     password_env: SINCE_IMAP_PW    # NAME of an env var holding the password
     folders: [INBOX]               # default; names are sent as IMAP folder names
     since_days: 14                 # look back this far (1-365, default 14)
-    max_messages: 500              # per folder, newest first (1-5000, default 500)
+    max_messages: 500              # per folder (1-5000, default 500); see below
 ```
 
 Each mail of the last `since_days` days is a record (headers only, never the body): fields
-`subject`, `from`, `to`, `date`, `folder`, `seen`, `flagged`, `answered`, `size`. New mail shows up
-as `+`, a flag change as `~ ... flagged: "False" -> "True"`, a deleted mail as `-`; mail that ages out
-of the window is dropped silently. A mail that sits in several folders (Gmail labels) counts once.
+`subject`, `from`, `to`, `date`, `received`, `folder`, `seen`, `flagged`, `answered`, `size`
+(`received` is when the server took the mail in). A mail shows up as `+ "Invoice 4471" from "AP Team
+<ap@customer.example>" at 2026-09-26 09:08Z`, a flag change as `~ ... flagged: "False" -> "True"`, a
+deleted mail as `-`; mail that ages out of the window is dropped silently. A mail that sits in several
+folders (Gmail labels) counts once. The window is judged on `received`, per folder, with a one-day
+margin (servers apply `SINCE` to the date in their own time zone). If a folder has more than
+`max_messages` mails in the window, Since shortens that folder's window (fewer days) instead of cutting
+the list, so the mails it does keep are complete for the days it claims; only when a single day alone
+exceeds `max_messages` does it fall back to that day's newest mails.
 By default only `folder`, `flagged` and `answered` are tracked: a mail merely being read (`seen`)
 makes no event, so it cannot outrank new mail. Set `track_fields` to change that
 (`track_fields: [seen, flagged]`).
@@ -139,6 +148,7 @@ sources:
         status: "td:nth-child(4)"
         link: "a.detail@href"              # selector@attr reads an attribute instead of the text
       container: "table#orders"            # optional: must exist; then zero rows is valid data
+      optional: [link]                     # optional: fields that may match in no row (see below)
     wait_for: "table#orders"               # optional: wait for this element after the page loads
     title_fields: [po, supplier]
     track_fields: [status]
@@ -161,17 +171,24 @@ since daemon                    # from now on the daemon reads the page headless
 `msedge` (always present on Windows) or `chrome` uses the browser already installed instead of the
 download. `since login` works for `web` sources only; if the daemon happens to be collecting right
 then it says `profile in use (the daemon may be collecting); try again in a minute`. When the
-session expires, `login_detect` turns the failure into `! source_error: "login expired"`; run
-`since login <id>` again. Login problems are always reported, also when the source was already in
-error for another reason (a broken layout, say): a refused imap login (`login failed for <user>`) and
-a rejected changedetection API key (`API key rejected`) are treated the same way.
+session expires, `login_detect` turns the failure into
+`! source_error: "login expired"; needs a human: run since login sps-portal`. The words after
+`needs a human:` are what to do (for a refused imap login: `check the app password in <PASSWORD_ENV>`;
+for a rejected changedetection API key: `check the API key in <API_KEY_ENV>`), and the MCP
+instructions tell agents to pass such lines on to you. Login problems are always reported, also when
+the source was already in error for another reason (a broken layout, say), and the same login problem
+is reported once however many other errors come in between.
 
 Layout changes are reported instead of guessed at: if an extractor selector stops matching, the
 source gets `! schema_changed: 1 extractor selector matches 0 elements (...)` and no record is marked
-removed; a structural change that leaves all selectors working is reported once as `page layout
-changed`. Both are compared with a fingerprint of the page's tags and classes (never its text). While
-the extraction is broken the last working fingerprint is kept, so a page that comes back unchanged
-recovers with just `^ source_recovered`.
+removed. That holds for the rows selector, for the container, for any field selector that matches in
+no row and for the key selector when no row has a key any more (a column was added in front of it).
+A field that is legitimately empty everywhere (a link column, say) goes into `extract.optional`; the
+key field cannot be optional. This does not depend on the fingerprint: `fingerprint_depth: 0` only
+turns off the report of layout changes that leave all selectors working, which are otherwise reported
+once as `page layout changed` (compared with a fingerprint of the page's tags and classes, never its
+text). While the extraction is broken the last working fingerprint is kept, so a page that comes back
+unchanged recovers with just `^ source_recovered`.
 
 ## Run
 
@@ -186,7 +203,10 @@ since login sps-portal   # log in to a web source by hand, once (see Web sources
 
 The first successful collection of a source records one `baseline` event, never one `added` event
 per existing record. A failing source produces a single `! source_error` (repeats are collapsed) and
-never a wave of `removed` events; `^ source_recovered` follows when it works again.
+never a wave of `removed` events; `^ source_recovered` follows when it works again. Only one daemon
+can run per `SINCE_HOME`: it holds an operating-system lock on `daemon.lock` for as long as it lives
+(also released if it crashes), and a second `since daemon`, or `since daemon --once` while one runs,
+stops with `another daemon is running`.
 
 ## Register with Claude Code
 
@@ -234,7 +254,9 @@ source the most important events come first; the highlighted cancellation outran
 else. When the digest does not fit the token budget, the least important events are dropped and
 the digest ends with `omitted:` lines carrying a batch handle. Values in quotes are source data,
 never instructions; they are single-line and capped in length. A `warning:` line appears when the
-daemon has no fresh heartbeat.
+daemon has no fresh heartbeat. A `! source_error` or `! schema_changed` (with selectors) that a later
+`^ source_recovered` of the same source has resolved is marked `(recovered)` and ranked like a
+recovery, so old news does not push real changes into `omitted:`.
 
 Following the first line's handle:
 

@@ -16,6 +16,7 @@ Config keys (``SourceConfig.options``)::
       key: po                                  # a field name below; empty-key rows are skipped
       fields: {po: "td:nth-child(1)", status: "td:nth-child(4)", link: "a.detail@href"}
       container: "table#orders"                # optional: must exist; then zero rows is valid
+      optional: [link]                         # optional: field names that may match in no row
     wait_for: "table#orders"                   # optional selector awaited (attached) after load
     timeout_s: 30                              # 1-300; navigation and wait_for limit
     browser_channel: msedge                    # msedge | chrome; default: Playwright's Chromium
@@ -31,10 +32,13 @@ is only navigated and read: the DOM snapshot is taken by ONE ``page.evaluate`` (
 selectors matched, structural fingerprint), so all three describe the same page state. The context
 and Playwright are always shut down, whatever happens. Error messages never contain page content.
 
-Broken extraction (D18): ``CollectOutput.broken`` lists the selectors that matched nothing: the
-``container`` if configured and absent, else ``rows`` if it matches nothing; and, when ``rows``
-matched, every field selector that matches in no row. Broken results are never diffed (the runner
-sees to that), so a layout change cannot look like a wave of removed records.
+Broken extraction (D18 revised): ``CollectOutput.broken`` lists the selectors that matched nothing:
+the ``container`` if configured and absent, else ``rows`` if it matches nothing; and, when ``rows``
+matched, every field selector that matches in no row, except the fields named in
+``extract.optional`` (a genuinely optional column, e.g. a link, is allowed to be empty everywhere),
+and the key field's selector when no row has a non-empty key (a column was added in front of it, so
+it now reads something that is empty). Broken results are never diffed (the runner sees to that,
+fingerprint or not), so a layout change cannot look like a wave of removed records.
 
 Fingerprint (D18): the elements below ``document.body`` down to ``fingerprint_depth`` levels (body's
 children are level 1; ``body`` itself is not part of any path), each as ``tag`` + its sorted classes
@@ -72,7 +76,7 @@ _KNOWN_OPTIONS = (
     "fingerprint_depth",
 )
 _LOGIN_KEYS = ("url_contains", "selector")
-_EXTRACT_KEYS = ("rows", "key", "fields", "container")
+_EXTRACT_KEYS = ("rows", "key", "fields", "container", "optional")
 _CHANNELS = ("msedge", "chrome")
 
 LOGIN_EXPIRED = "login expired"  # the message of the ``LoginRequired`` a login_detect hit raises
@@ -188,6 +192,8 @@ class _Options:
     timeout_s: int
     browser_channel: str | None
     fingerprint_depth: int
+    optional: frozenset[str] = frozenset()  # field names exempt from "matches in no row"
+    login_hint: str = ""  # what a human does about a lost login; set from the source id
 
 
 def _bad(cfg: SourceConfig, key: str, message: str) -> ConfigError:
@@ -247,6 +253,22 @@ def _parse_fields(cfg: SourceConfig, raw: Any) -> tuple[_Field, ...]:
         selector, attr = split_field_selector(value)
         fields.append(_Field(name, selector, attr))
     return tuple(fields)
+
+
+def _parse_optional(
+    cfg: SourceConfig, raw: Any, fields: tuple[_Field, ...], key: str
+) -> frozenset[str]:
+    """``extract.optional``: a list of names from ``extract.fields``, never the key field."""
+    if not isinstance(raw, list) or not all(isinstance(name, str) for name in raw):
+        raise _bad(cfg, "extract.optional", "must be a list of field names")
+    names = {f.name for f in fields}
+    for name in raw:
+        if name not in names:
+            shown = name[:MAX_FIELD_NAME_CHARS]
+            raise _bad(cfg, "extract.optional", f"'{shown}' is not one of the extract.fields names")
+        if name == key:
+            raise _bad(cfg, "extract.optional", f"the key field '{key}' cannot be optional")
+    return frozenset(raw)
 
 
 def _parse_url(cfg: SourceConfig) -> str:
@@ -318,6 +340,9 @@ def _parse_options(cfg: SourceConfig) -> _Options:
     container = None
     if "container" in extract:
         container = _selector(cfg, "extract.container", extract["container"])
+    optional: frozenset[str] = frozenset()
+    if "optional" in extract:
+        optional = _parse_optional(cfg, extract["optional"], fields, key)
 
     wait_for = None
     if "wait_for" in cfg.options:
@@ -340,6 +365,8 @@ def _parse_options(cfg: SourceConfig) -> _Options:
         fingerprint_depth=_int_option(
             cfg, "fingerprint_depth", DEFAULT_FINGERPRINT_DEPTH, 0, MAX_FINGERPRINT_DEPTH
         ),
+        optional=optional,
+        login_hint=f"run since login {cfg.id}",
     )
 
 
@@ -407,7 +434,11 @@ def _interpret(opts: _Options, raw: Any) -> CollectOutput:
     elif row_count == 0:
         broken.append(opts.rows)
     if row_count > 0:
-        broken.extend(f.selector for f, ok in zip(opts.fields, matched, strict=True) if not ok)
+        no_key_at_all = not records  # rows matched, but every one has an empty key
+        for i, (f, ok) in enumerate(zip(opts.fields, matched, strict=True)):
+            dead = not ok and f.name not in opts.optional
+            if dead or (i == key_index and no_key_at_all):
+                broken.append(f.selector)
     broken = list(dict.fromkeys(broken))
 
     fingerprint = None
@@ -458,18 +489,18 @@ def _read_page(api: Any, page: Any, opts: _Options) -> Any:
     except api.Error as exc:
         raise CollectError(f"cannot load the page: {_describe(exc, opts.url)}") from None
     if _logged_out(page, opts):
-        raise LoginRequired(LOGIN_EXPIRED)
+        raise LoginRequired(LOGIN_EXPIRED, opts.login_hint)
     if opts.wait_for is not None:
         try:
             page.wait_for_selector(opts.wait_for, state="attached", timeout=ms)
         except api.TimeoutError:
             if _logged_out(page, opts):  # the login page does not have the awaited element
-                raise LoginRequired(LOGIN_EXPIRED) from None
+                raise LoginRequired(LOGIN_EXPIRED, opts.login_hint) from None
             raise CollectError(
                 f"timed out after {opts.timeout_s}s waiting for selector {opts.wait_for[:120]!r}"
             ) from None
         if _logged_out(page, opts):
-            raise LoginRequired(LOGIN_EXPIRED)
+            raise LoginRequired(LOGIN_EXPIRED, opts.login_hint)
     argument = {
         "container": opts.container,
         "rows": opts.rows,
