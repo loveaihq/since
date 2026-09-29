@@ -38,9 +38,11 @@ from since.model import (
 from since.sources import (
     CollectError,
     CollectOutput,
+    LoginRequired,
     Window,
     get_collector,
     title_fields_for,
+    track_fields_for,
 )
 from since.store import Store
 from since.timeutil import to_iso
@@ -1770,7 +1772,7 @@ def test_broken_selectors_on_a_baselined_source_leave_the_snapshot_alone(
     assert (state.last_error, state.last_error_at) == (ROWS_MESSAGE, to_iso(at(5)))
     assert state.last_success_at == to_iso(at(0))  # a broken extraction is not a success
     assert state.record_count == 2 and state.baselined is True
-    assert structure(store) == (F2, [ROWS])
+    assert structure(store) == (F1, [ROWS])  # D25: the fingerprint stays the last good one
 
 
 def test_broken_selectors_are_never_diffed_even_when_rows_came_back(
@@ -1816,22 +1818,37 @@ def test_a_lasting_broken_state_is_announced_once(store: Store, fake: FakeCollec
     assert state is not None
     assert state.error_since == to_iso(at(5))  # the streak began at the first broken run
     assert (state.last_error, state.last_error_at) == (message, to_iso(at(10)))
-    assert structure(store) == (F2, ["a", "b"])  # stored sorted
+    assert structure(store) == (F1, ["a", "b"])  # broken stored sorted, fingerprint = last good
+
+
+def test_only_the_broken_selectors_decide_whether_a_broken_run_is_announced(
+    store: Store, fake: FakeCollector
+) -> None:
+    # D25: what the page looks like while it is broken is not compared; only the selectors are
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
+
+    again = run(store, cfg, fake, out([], fingerprint=F3, broken=[ROWS]), 10)  # layout moved again
+
+    assert again == CollectResult(seqs=[], error=ROWS_MESSAGE)
+    assert [e.kind for e in store.events_after(0, "src")] == [KIND_BASELINE, KIND_SCHEMA_CHANGED]
+    assert structure(store) == (F1, [ROWS])  # still the last good fingerprint
 
 
 @pytest.mark.parametrize(
-    ("fingerprint", "broken"),
-    [(F2, [ROWS, "td.status"]), (F2, ["td.status"]), (F3, [ROWS])],
-    ids=["more-selectors", "other-selector", "other-fingerprint"],
+    "broken",
+    [[ROWS, "td.status"], ["td.status"]],
+    ids=["more-selectors", "other-selector"],
 )
 def test_a_different_broken_state_is_a_new_schema_changed(
-    store: Store, fake: FakeCollector, fingerprint: str, broken: list[str]
+    store: Store, fake: FakeCollector, broken: list[str]
 ) -> None:
     cfg = make_cfg()
     run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
     run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
 
-    result = run(store, cfg, fake, out([], fingerprint=fingerprint, broken=broken), 10)
+    result = run(store, cfg, fake, out([], fingerprint=F2, broken=broken), 10)
 
     events = store.events_after(0, "src")
     assert [e.kind for e in events] == [KIND_BASELINE, KIND_SCHEMA_CHANGED, KIND_SCHEMA_CHANGED]
@@ -1839,28 +1856,28 @@ def test_a_different_broken_state_is_a_new_schema_changed(
     assert result.seqs == [events[2].seq]
     state = store.get_source_state("src")
     assert state is not None and state.error_since == to_iso(at(5))  # still the same streak
-    assert structure(store) == (fingerprint, sorted(broken))
+    assert structure(store) == (F1, sorted(broken))
 
 
-def test_recovery_after_the_selectors_were_fixed_is_a_recovery_and_a_normal_diff(
+def test_break_then_the_identical_page_is_only_a_recovery(
     store: Store, fake: FakeCollector
 ) -> None:
+    # D25: the broken run did not move the stored (good) fingerprint, so the page that comes back
+    # unchanged is not a "layout change"
     cfg = make_cfg()
     run(store, cfg, fake, out([rec("a", v=1), rec("b", v=1)], fingerprint=F1), 0)
     run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
 
-    # the human fixed the extractor for the new layout: same fingerprint as in the broken state
-    result = run(store, cfg, fake, out([rec("a", v=2), rec("b", v=1)], fingerprint=F2), 10)
+    result = run(store, cfg, fake, out([rec("a", v=1), rec("b", v=1)], fingerprint=F1), 10)
 
     events = store.events_after(0, "src")
     assert [(e.kind, e.record_key) for e in events] == [
         (KIND_BASELINE, None),
-        (KIND_SCHEMA_CHANGED, None),
-        (KIND_SOURCE_RECOVERED, None),
-        (KIND_MODIFIED, "a"),
+        (KIND_SCHEMA_CHANGED, None),  # the break
+        (KIND_SOURCE_RECOVERED, None),  # and nothing else
     ]
     assert events[2].detail == {"error_since": to_iso(at(5)), "last_error": ROWS_MESSAGE}
-    assert result.error is None and len(result.seqs) == 2
+    assert result == CollectResult(seqs=[events[2].seq], error=None)
     state = store.get_source_state("src")
     assert state is not None
     assert (state.in_error, state.error_since, state.last_success_at) == (
@@ -1868,11 +1885,11 @@ def test_recovery_after_the_selectors_were_fixed_is_a_recovery_and_a_normal_diff
         None,
         to_iso(at(10)),
     )
-    assert structure(store) == (F2, [])
+    assert structure(store) == (F1, [])
     assert state.record_count == 2
 
 
-def test_recovery_with_yet_another_layout_reports_it_after_the_recovery(
+def test_break_then_the_identical_page_still_diffs_the_data_normally(
     store: Store, fake: FakeCollector
 ) -> None:
     cfg = make_cfg()
@@ -1881,16 +1898,67 @@ def test_recovery_with_yet_another_layout_reports_it_after_the_recovery(
 
     run(store, cfg, fake, out([rec("a", v=2)], fingerprint=F1), 10)  # back to the first layout
 
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_SCHEMA_CHANGED, None),  # the break
+        (KIND_SOURCE_RECOVERED, None),
+        (KIND_MODIFIED, "a"),  # no layout change in between
+    ]
+
+
+def test_break_then_a_different_working_layout_is_a_recovery_and_one_layout_change(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1), rec("b", v=1)], fingerprint=F1), 0)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
+
+    # the page comes back with yet another structure whose selectors match (e.g. the human fixed
+    # the extractor for the new layout): compared with the last good fingerprint, F1
+    result = run(store, cfg, fake, out([rec("a", v=2), rec("b", v=1)], fingerprint=F3), 10)
+
     events = store.events_after(0, "src")
     assert [(e.kind, e.record_key) for e in events] == [
         (KIND_BASELINE, None),
-        (KIND_SCHEMA_CHANGED, None),  # broken
+        (KIND_SCHEMA_CHANGED, None),  # the break
         (KIND_SOURCE_RECOVERED, None),
-        (KIND_SCHEMA_CHANGED, None),  # F2 -> F1, nothing broken
+        (KIND_SCHEMA_CHANGED, None),  # F1 -> F3, nothing broken
         (KIND_MODIFIED, "a"),
     ]
+    assert events[1].detail == {"selectors": [ROWS]}
     assert events[3].detail == {"selectors": []}
-    assert structure(store) == (F1, [])
+    assert result.error is None and len(result.seqs) == 3
+    state = store.get_source_state("src")
+    assert state is not None
+    assert (state.in_error, state.error_since, state.last_success_at) == (
+        False,
+        None,
+        to_iso(at(10)),
+    )
+    assert structure(store) == (F3, [])
+    assert state.record_count == 2
+
+    run(store, cfg, fake, out([rec("a", v=3), rec("b", v=1)], fingerprint=F3), 15)  # settled
+    assert kinds(store)[5:] == [(KIND_MODIFIED, "a")]  # no second layout change
+
+
+def test_break_then_the_layout_that_was_seen_while_broken_is_still_a_layout_change(
+    store: Store, fake: FakeCollector
+) -> None:
+    # Only the last good fingerprint counts: F2 was the (broken) page of the outage, and the source
+    # comes back on it after the extractor was fixed -> reported once, after the recovery.
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
+
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F2), 10)
+
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_SCHEMA_CHANGED, None),
+        (KIND_SOURCE_RECOVERED, None),
+        (KIND_SCHEMA_CHANGED, None),
+    ]
 
 
 def test_a_layout_only_change_is_reported_once_then_diffed_normally(
@@ -2138,3 +2206,275 @@ def test_crash_after_a_layout_schema_changed_rolls_everything_back(
 
     assert _db_state(store) == before
     assert structure(store) == (F1, [])
+
+
+# -- login problems are always surfaced (D24) ----------------------------------------------------
+
+LOGIN_EXPIRED = "login expired"
+
+
+def test_login_required_is_a_collect_error_with_its_message() -> None:
+    exc = LoginRequired(LOGIN_EXPIRED)
+
+    assert isinstance(exc, CollectError)
+    assert str(exc) == LOGIN_EXPIRED
+
+
+def test_a_login_failure_of_a_healthy_source_is_an_ordinary_source_error(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(priority="high")
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+
+    result = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 5)
+
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
+    error = store.events_after(0)[-1]
+    assert result == CollectResult(seqs=[error.seq], error=LOGIN_EXPIRED)
+    assert error.detail == {"error": LOGIN_EXPIRED} and error.importance == 15
+    state = store.get_source_state("src")
+    assert state is not None
+    assert (state.in_error, state.error_since, state.last_error) == (
+        True,
+        to_iso(at(5)),
+        LOGIN_EXPIRED,
+    )
+
+
+def test_plain_error_then_login_error_then_the_same_login_error_then_recovery(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(priority="high")
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    run(store, cfg, fake, CollectError("connection refused"), 5)
+
+    # the cause changed to something only a human can fix: announced although already in error
+    login = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 10)
+
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_SOURCE_ERROR, None),
+        (KIND_SOURCE_ERROR, None),
+    ]
+    announced = store.events_after(0)[-1]
+    assert login == CollectResult(seqs=[announced.seq], error=LOGIN_EXPIRED)
+    assert announced.detail == {"error": LOGIN_EXPIRED}
+    assert announced.created_at == to_iso(at(10)) and announced.importance == 15
+    state = store.get_source_state("src")
+    assert state is not None
+    assert state.in_error is True
+    assert state.error_since == to_iso(at(5))  # still the streak that began with the first error
+    assert (state.last_error, state.last_error_at) == (LOGIN_EXPIRED, to_iso(at(10)))
+
+    # the same login error again: deduplicated like any other failure
+    again = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 15)
+
+    assert again == CollectResult(seqs=[], error=LOGIN_EXPIRED)
+    assert len(kinds(store)) == 3
+    state = store.get_source_state("src")
+    assert state is not None and state.error_since == to_iso(at(5))
+    assert (state.last_error, state.last_error_at) == (LOGIN_EXPIRED, to_iso(at(15)))
+
+    # the human logs in again: one recovery, for the whole streak
+    run(store, cfg, fake, [rec("a", v=1)], 20)
+
+    assert kinds(store)[3:] == [(KIND_SOURCE_RECOVERED, None)]
+    recovered = store.events_after(0)[-1]
+    assert recovered.detail == {"error_since": to_iso(at(5)), "last_error": LOGIN_EXPIRED}
+    state = store.get_source_state("src")
+    assert state is not None and (state.in_error, state.error_since) == (False, None)
+
+
+def test_a_plain_error_after_a_login_error_stays_deduplicated(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 5)
+
+    result = run(store, cfg, fake, CollectError("connection refused"), 10)
+
+    assert result == CollectResult(seqs=[], error="connection refused")
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
+
+    # ... but when the login problem is back, that is news again (the message changed)
+    run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 15)
+    assert kinds(store)[2:] == [(KIND_SOURCE_ERROR, None)]
+
+
+def test_a_login_error_with_another_message_is_announced_again(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    run(store, cfg, fake, LoginRequired("login failed for a@example.test"), 5)
+
+    run(store, cfg, fake, LoginRequired("login failed for a@example.test"), 10)  # same: quiet
+    run(store, cfg, fake, LoginRequired("login failed for b@example.test"), 15)  # other user
+
+    events = store.events_after(0)
+    assert [e.kind for e in events] == [KIND_BASELINE, KIND_SOURCE_ERROR, KIND_SOURCE_ERROR]
+    assert events[2].detail == {"error": "login failed for b@example.test"}
+
+
+def test_a_login_error_after_a_broken_extraction_is_announced(
+    store: Store, fake: FakeCollector
+) -> None:
+    # the agent saw "layout broken"; the cause now is "log in again"
+    cfg = make_cfg()
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 0)
+    run(store, cfg, fake, out([], fingerprint=F2, broken=[ROWS]), 5)
+
+    result = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 10)
+
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_SCHEMA_CHANGED, None),
+        (KIND_SOURCE_ERROR, None),
+    ]
+    assert result.error == LOGIN_EXPIRED and len(result.seqs) == 1
+    state = store.get_source_state("src")
+    assert state is not None and state.error_since == to_iso(at(5))
+
+    # logged in again, and the page is fine: only the recovery (the broken run kept the good
+    # fingerprint, D25)
+    run(store, cfg, fake, out([rec("a", v=1)], fingerprint=F1), 15)
+    assert kinds(store)[3:] == [(KIND_SOURCE_RECOVERED, None)]
+
+
+def test_a_login_error_on_the_first_run_is_announced_once(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+
+    first = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 0)
+    second = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 5)
+
+    assert len(first.seqs) == 1 and second.seqs == []
+    assert kinds(store) == [(KIND_SOURCE_ERROR, None)]
+
+
+def test_a_stale_login_error_is_discarded(store: Store, fake: FakeCollector) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    run(store, cfg, fake, CollectError("down"), 5)
+    run(store, cfg, fake, CollectError("down"), 20)  # a newer run committed first
+    before = _all_state(store)
+
+    result = run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 10)
+
+    assert result == CollectResult(seqs=[], error=None, superseded=True)
+    assert _all_state(store) == before
+
+
+def test_crash_while_announcing_a_login_error_leaves_no_partial_state(
+    store: Store, fake: FakeCollector, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a", v=1)], 0)
+    run(store, cfg, fake, CollectError("down"), 5)
+    before = _db_state(store)
+
+    _crash_on_call(monkeypatch, store, "update_source_state", 1)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        run(store, cfg, fake, LoginRequired(LOGIN_EXPIRED), 10)
+
+    assert _db_state(store) == before
+    assert store._conn.in_transaction is False
+
+
+# -- default track fields (D26) ------------------------------------------------------------------
+
+
+class TrackedFake(FakeCollector):
+    """A fake that also defines the optional ``default_track_fields`` (like imap)."""
+
+    def __init__(self, defaults: list[str] | None) -> None:
+        super().__init__()
+        self.defaults = defaults
+
+    def default_track_fields(self, cfg: SourceConfig) -> list[str] | None:
+        return None if self.defaults is None else list(self.defaults)
+
+
+def test_track_fields_for_prefers_config_then_collector_default_then_all_fields() -> None:
+    tracked = TrackedFake(["folder", "flagged"])
+    assert track_fields_for(make_cfg(), tracked) == ["folder", "flagged"]
+    assert track_fields_for(make_cfg(track_fields=["seen"]), tracked) == ["seen"]
+    # the collector has no default_track_fields at all: None = every field
+    assert track_fields_for(make_cfg(), FakeCollector()) is None
+    assert track_fields_for(make_cfg(track_fields=["seen"]), FakeCollector()) == ["seen"]
+    assert track_fields_for(make_cfg(), TrackedFake(None)) is None
+    # the returned list is a copy: callers cannot change the config through it
+    cfg = make_cfg(track_fields=["seen"])
+    resolved = track_fields_for(cfg, tracked)
+    assert resolved is not None
+    resolved.append("x")
+    assert cfg.track_fields == ["seen"]
+
+
+def test_builtin_collectors_other_than_imap_track_every_field_by_default() -> None:
+    for type_name in ("dir", "sql", "web", "changedetection"):
+        assert track_fields_for(make_cfg(type=type_name), get_collector(type_name)) is None
+    imap = get_collector("imap")
+    assert track_fields_for(make_cfg(type="imap"), imap) == ["folder", "flagged", "answered"]
+
+
+def test_collector_default_track_fields_limit_the_events_but_not_the_snapshot(
+    store: Store,
+) -> None:
+    fake = TrackedFake(["flagged"])
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("m", flagged=False, seen=False)], 0)
+
+    result = run(store, cfg, fake, [rec("m", flagged=False, seen=True)], 5)  # only `seen` moved
+
+    assert result == CollectResult(seqs=[], error=None)
+    assert kinds(store) == [(KIND_BASELINE, None)]
+    # the snapshot follows the content, so the next diff compares against the new state
+    assert store.get_snapshot("src")["m"].fields == {"flagged": False, "seen": True}
+
+    run(store, cfg, fake, [rec("m", flagged=True, seen=True)], 10)
+    modified = store.events_after(0)[-1]
+    assert (modified.kind, modified.record_key) == (KIND_MODIFIED, "m")
+    assert modified.field_changes == [FieldChange("flagged", False, True)]
+
+    both = [rec("m", flagged=True, seen=False), rec("n", flagged=False, seen=True)]
+    run(store, cfg, fake, both, 15)
+    assert kinds(store)[2:] == [(KIND_ADDED, "n")]  # `seen` is still not news; added records are
+
+
+def test_configured_track_fields_replace_the_collector_default(store: Store) -> None:
+    fake = TrackedFake(["flagged"])
+    cfg = make_cfg(track_fields=["seen"])
+    run(store, cfg, fake, [rec("m", flagged=False, seen=False)], 0)
+
+    run(store, cfg, fake, [rec("m", flagged=True, seen=False)], 5)  # the default's field: quiet
+    assert kinds(store) == [(KIND_BASELINE, None)]
+
+    run(store, cfg, fake, [rec("m", flagged=True, seen=True)], 10)
+    modified = store.events_after(0)[-1]
+    assert modified.kind == KIND_MODIFIED
+    assert modified.field_changes == [FieldChange("seen", False, True)]
+
+
+def test_a_collector_without_default_track_fields_tracks_everything(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("m", flagged=False, seen=False)], 0)
+
+    run(store, cfg, fake, [rec("m", flagged=False, seen=True)], 5)
+
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_MODIFIED, "m")]
+
+
+def test_a_failing_default_track_fields_is_a_source_failure(store: Store) -> None:
+    class Broken(TrackedFake):
+        def default_track_fields(self, cfg: SourceConfig) -> list[str] | None:
+            raise RuntimeError("no fields for you")
+
+    result = run(store, make_cfg(), Broken([]), [rec("m", v=1)], 0)
+
+    assert result.error == "RuntimeError: no fields for you"
+    assert [e.kind for e in store.events_after(0)] == [KIND_SOURCE_ERROR]

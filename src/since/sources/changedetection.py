@@ -42,7 +42,7 @@ from urllib.parse import quote, urlencode, urlsplit
 
 from since.config import ConfigError, SourceConfig
 from since.model import Record, Scalar
-from since.sources import CollectError
+from since.sources import CollectError, LoginRequired
 from since.timeutil import to_iso
 
 MAX_LIST_BYTES = 32 * 1024 * 1024
@@ -197,7 +197,7 @@ class _Api:
             status = exc.code
             exc.close()
             if status in (401, 403):
-                raise CollectError("API key rejected") from None
+                raise LoginRequired("API key rejected") from None
             raise _HttpStatus(status, path) from None
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
             reason = _reason_text(exc)
@@ -281,7 +281,8 @@ class ChangedetectionCollector:
         try:
             return self._collect(api, tag, fetch_text)
         except CollectError as exc:
-            raise CollectError(api.scrub(str(exc))) from None
+            # keep the class: a rejected API key must stay a LoginRequired (D24)
+            raise type(exc)(api.scrub(str(exc))) from None
         except Exception as exc:
             raise CollectError(api.scrub(f"{type(exc).__name__}: {exc}")) from None
 

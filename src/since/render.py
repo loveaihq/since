@@ -162,8 +162,9 @@ def event_body(event: Event, key_label: str, cap: int) -> str:
         selectors = _selectors(event)
         quoted = ", ".join(q(s, cap) for s in selectors)
         if len(selectors) == 1:
-            return f"! schema_changed: 1 extractor selector matches 0 rows ({quoted})"
+            return f"! schema_changed: 1 extractor selector matches 0 elements ({quoted})"
         if selectors:
-            return f"! schema_changed: {len(selectors)} extractor selectors match 0 rows ({quoted})"
+            count = len(selectors)
+            return f"! schema_changed: {count} extractor selectors match 0 elements ({quoted})"
         return f"! schema_changed: {LAYOUT_CHANGED_TEXT}"
     return f"? {q(kind, cap)}"

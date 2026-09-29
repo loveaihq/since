@@ -22,6 +22,15 @@ class CollectError(Exception):
     ``str(exc)`` is stored as the ``source_error`` message, so it must not contain secrets."""
 
 
+class LoginRequired(CollectError):
+    """A collection failed for a reason only a human can fix: the login is gone or refused (web
+    ``login expired``, imap ``login failed for <user>``, changedetection ``API key rejected``).
+
+    The runner always surfaces such a failure (D24): while the source is already in error, one
+    with a message that differs from the current ``last_error`` still appends a ``source_error``,
+    so an agent that saw "layout broken" learns that the cause is now "log in again"."""
+
+
 @dataclass(frozen=True)
 class Window:
     """How far back a source looks (D21): ``field`` names a record field holding an ISO UTC
@@ -64,7 +73,12 @@ class Collector(Protocol):
     the field names that make up a record's title (D17) when the source has no ``title_fields``
     option, e.g. imap ``["subject", "from"]``. A collector without it has no default title
     (``[]``). It is deliberately not declared here so that it stays optional; always go through
-    :func:`title_fields_for`."""
+    :func:`title_fields_for`.
+
+    Likewise the optional ``default_track_fields(cfg) -> list[str]`` (D26): the fields whose changes
+    make an event when the source has no ``track_fields`` option, e.g. imap
+    ``["folder", "flagged", "answered"]`` (a mail merely being read is not news). A collector
+    without it tracks every field. Always go through :func:`track_fields_for`."""
 
     type_name: str
 
@@ -104,6 +118,18 @@ def title_fields_for(cfg: SourceConfig, collector: Collector) -> list[str]:
         return list(cfg.title_fields)
     default = getattr(collector, "default_title_fields", None)
     return list(default(cfg)) if callable(default) else []
+
+
+def track_fields_for(cfg: SourceConfig, collector: Collector) -> list[str] | None:
+    """The tracked fields of a source (D26): ``cfg.track_fields`` if configured, else the
+    collector's ``default_track_fields(cfg)`` if it has that method, else ``None`` (all fields)."""
+    if cfg.track_fields is not None:
+        return list(cfg.track_fields)
+    default = getattr(collector, "default_track_fields", None)
+    if not callable(default):
+        return None
+    fields = default(cfg)
+    return None if fields is None else list(fields)
 
 
 def get_collector(type_name: str) -> Collector:

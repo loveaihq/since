@@ -25,7 +25,7 @@ from since.model import (
     KIND_SOURCE_RECOVERED,
 )
 from since.service import Service
-from since.sources import CollectError, title_fields_for
+from since.sources import CollectError, LoginRequired, title_fields_for
 from since.sources import changedetection as cdmod
 from since.sources.changedetection import ChangedetectionCollector
 from since.store import Store
@@ -634,6 +634,49 @@ def test_a_key_rejected_on_the_snapshot_request_is_the_same_error(
     api.fail[f"/api/v1/watch/{W1}/history/latest"] = 401
     assert run(store, make_cfg(api)).error == "API key rejected"
     assert [e.kind for e in events(store)] == [KIND_SOURCE_ERROR]  # first run: failure, no baseline
+
+
+@pytest.mark.parametrize("path", ["*", f"/api/v1/watch/{W1}/history/latest"])
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_api_key_raises_login_required(api: FakeApi, path: str, status: int) -> None:
+    # D24: the list request and the per-watch snapshot request; the scrubbing wrapper in
+    # ``collect`` must keep the class
+    api.fail[path] = status
+
+    with pytest.raises(LoginRequired) as info:
+        ChangedetectionCollector().collect(make_cfg(api))
+
+    assert str(info.value) == "API key rejected"
+
+
+def test_other_http_errors_are_not_login_problems(api: FakeApi) -> None:
+    api.fail["*"] = 500
+    with pytest.raises(CollectError) as info:
+        ChangedetectionCollector().collect(make_cfg(api))
+    assert not isinstance(info.value, LoginRequired)
+
+    api.fail["*"] = 404
+    with pytest.raises(CollectError) as info:
+        ChangedetectionCollector().collect(make_cfg(api))
+    assert not isinstance(info.value, LoginRequired)
+
+
+def test_a_key_rejected_while_the_source_is_already_failing_is_announced(
+    api: FakeApi, store: Store
+) -> None:
+    run(store, make_cfg(api), 0)
+    api.fail["*"] = 500
+    assert run(store, make_cfg(api), 1).error == "HTTP 500 from /api/v1/watch"
+    api.fail["*"] = 401
+
+    result = run(store, make_cfg(api), 2)
+
+    assert result.error == "API key rejected" and len(result.seqs) == 1
+    assert run(store, make_cfg(api), 3).seqs == []  # the same again: quiet
+    assert [e.detail["error"] for e in events(store) if e.kind == KIND_SOURCE_ERROR] == [
+        "HTTP 500 from /api/v1/watch",
+        "API key rejected",
+    ]
 
 
 def test_connection_refused_is_a_source_error_never_removed_and_recovers(

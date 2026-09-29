@@ -88,8 +88,11 @@ sources:
 
 Each mail of the last `since_days` days is a record (headers only, never the body): fields
 `subject`, `from`, `to`, `date`, `folder`, `seen`, `flagged`, `answered`, `size`. New mail shows up
-as `+`, a flag change as `~ ... seen: "False" -> "True"`, a deleted mail as `-`; mail that ages out of
-the window is dropped silently. A mail that sits in several folders (Gmail labels) counts once.
+as `+`, a flag change as `~ ... flagged: "False" -> "True"`, a deleted mail as `-`; mail that ages out
+of the window is dropped silently. A mail that sits in several folders (Gmail labels) counts once.
+By default only `folder`, `flagged` and `answered` are tracked: a mail merely being read (`seen`)
+makes no event, so it cannot outrank new mail. Set `track_fields` to change that
+(`track_fields: [seen, flagged]`).
 The collector is read-only (`EXAMINE` and `BODY.PEEK` only): it never marks a mail as read.
 
 Gmail and Google Workspace: turn IMAP on in the account, enable 2-step verification and create an
@@ -159,12 +162,16 @@ since daemon                    # from now on the daemon reads the page headless
 download. `since login` works for `web` sources only; if the daemon happens to be collecting right
 then it says `profile in use (the daemon may be collecting); try again in a minute`. When the
 session expires, `login_detect` turns the failure into `! source_error: "login expired"`; run
-`since login <id>` again.
+`since login <id>` again. Login problems are always reported, also when the source was already in
+error for another reason (a broken layout, say): a refused imap login (`login failed for <user>`) and
+a rejected changedetection API key (`API key rejected`) are treated the same way.
 
 Layout changes are reported instead of guessed at: if an extractor selector stops matching, the
-source gets `! schema_changed: 1 extractor selector matches 0 rows (...)` and no record is marked
+source gets `! schema_changed: 1 extractor selector matches 0 elements (...)` and no record is marked
 removed; a structural change that leaves all selectors working is reported once as `page layout
-changed`. Both are compared with a fingerprint of the page's tags and classes (never its text).
+changed`. Both are compared with a fingerprint of the page's tags and classes (never its text). While
+the extraction is broken the last working fingerprint is kept, so a page that comes back unchanged
+recovers with just `^ source_recovered`.
 
 ## Run
 

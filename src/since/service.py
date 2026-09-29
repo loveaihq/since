@@ -184,7 +184,7 @@ def _event_lines(event: Event, key_label: str) -> list[str]:
         selectors = _selectors(event)
         if not selectors:
             return [LAYOUT_CHANGED_TEXT]
-        return ["selectors matching 0 rows:", *(q(s, GET_CAP) for s in selectors)]
+        return ["selectors matching 0 elements:", *(q(s, GET_CAP) for s in selectors)]
     return []
 
 

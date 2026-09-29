@@ -73,6 +73,7 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   back unchanged recovers with just `source_recovered` (no spurious "layout changed").
 - **D26 (M2) Collector default `track_fields`.** Like titles (D17), a collector may supply default
   `track_fields`; imap uses `[folder, flagged, answered]`, so a mail merely being read (`seen`) no longer
-  creates an event that outranks new mail. Config `track_fields` still overrides.
+  creates an event that outranks new mail. Config `track_fields` still overrides. Default track fields
+  only filter modifications; `+` lines list fields only when `track_fields` is set in the config.
 - **D27 (M2) Selector wording.** `schema_changed` says `matches 0 elements` (not `rows`): the broken selector
   can be a container or a field selector.

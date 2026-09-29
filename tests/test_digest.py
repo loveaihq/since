@@ -1094,10 +1094,10 @@ def test_body_other_kinds() -> None:
     assert body(ev(1, "d", KIND_SOURCE_RECOVERED)) == "^ source_recovered"
     one = ev(1, "d", KIND_SCHEMA_CHANGED, detail={"selectors": ["table#orders tbody tr"]})
     assert body(one) == (
-        '! schema_changed: 1 extractor selector matches 0 rows ("table#orders tbody tr")'
+        '! schema_changed: 1 extractor selector matches 0 elements ("table#orders tbody tr")'
     )
     two = ev(1, "d", KIND_SCHEMA_CHANGED, detail={"selectors": ["a", "b"]})
-    assert body(two) == '! schema_changed: 2 extractor selectors match 0 rows ("a", "b")'
+    assert body(two) == '! schema_changed: 2 extractor selectors match 0 elements ("a", "b")'
 
 
 def test_body_schema_changed_without_selectors_is_a_layout_change() -> None:

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 from cd_fake import FakeApi
@@ -188,7 +189,7 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         # The inbox (window: 14 days): two recent mails, one 10 days old, one 20 days old that
         # is outside the window and therefore never collected.
         edi = "EDI Desk <edi@supplier.example>"
-        mail(2, "<asn@supplier.example>", "Re: DJ ASN rejection", edi, "\\Seen")
+        asn = mail(2, "<asn@supplier.example>", "Re: DJ ASN rejection", edi, "\\Seen")
         unread = mail(
             3, "<inv@customer.example>", "Invoice 4471 overdue", "AP Team <ap@customer.example>"
         )
@@ -222,11 +223,13 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
             assert group(digest, header) == ["  = baseline: 3 records"], header
         assert "Ancient" not in run.out
 
-        # 2. Mutate: a new mail; a mail read; a mail that ages out (the window shrinks to 7 days
+        # 2. Mutate: a new mail; a mail flagged (an event); another mail marked unread again (a
+        #    `seen`-only change: no event, D26); a mail that ages out (the window shrinks to 7 days
         #    and the 10-day-old mail is deleted, like the 20-day-old one); a watch's snapshot text
         #    (a real change moves last_changed too); a portal row Open -> Cancelled.
         mail(0.05, "<asn-new@supplier.example>", "PO 4500123 cancelled - please confirm", edi)
-        imap.set_flags("INBOX", unread, "\\Seen")
+        imap.set_flags("INBOX", unread, "\\Flagged")
+        imap.set_flags("INBOX", asn)  # was \Seen
         imap.delete_message("INBOX", aged)
         imap.delete_message("INBOX", ancient)
         write_config(home, imap, api, site, days=7)
@@ -255,12 +258,15 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert digest.index("[normal] inbox (3)") < digest.index("[low] watches (2)")
         assert group(digest, "[high] sps-portal") == [portal_line, "  = baseline: 3 records"]
         assert group(digest, "[normal] inbox") == [
-            # D6: with no track_fields every modification weighs more than an addition
+            # a tracked-field modification (flagged) weighs more than an addition; the mail that
+            # was only marked unread again (`seen`, not tracked by default, D26) has no line
             '  ~ "Invoice 4471 overdue" from "AP Team <ap@customer.example>"'
-            ' seen: "False" -> "True"',
+            ' flagged: "False" -> "True"',
+            # collector-default track fields are not listed on added lines (D26)
             f'  + "PO 4500123 cancelled - please confirm" from "{edi}"',
             "  = baseline: 3 records",
         ]
+        assert "ASN rejection" not in run.out and "seen" not in run.out
         assert group(digest, "[low] watches") == [
             f'  ~ "Supplier price list" last_changed: "{CHANGED_1_ISO}" -> "{CHANGED_2_ISO}"; '
             "text changed (+1/-1 chars)",
@@ -297,6 +303,10 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert run.lines[0].startswith(f"{mail_rec} · inbox · present · updated ")
         assert 'subject: "PO 4500123 cancelled - please confirm"' in run.lines
         assert f'from: "{edi}"' in run.lines
+        # the mail that was only marked unread again made no event, but its record follows it
+        run = since("get", "since://rec/inbox/" + quote("<asn@supplier.example>", safe="/|"))
+        assert run.code == 0
+        assert 'seen: "False"' in run.lines and 'subject: "Re: DJ ASN rejection"' in run.lines
 
         # 5. ack next_cursor.
         next_cursor = int(only(r"next_cursor=(\d+)$", digest[:1]).group(1))
@@ -320,7 +330,8 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         assert digest[0] == "since · agent=default · events 8-8 (1) · budget 800 · next_cursor=8"
         assert digest[2:] == [
             "[high] sps-portal (1)",
-            f'  ! schema_changed: 1 extractor selector matches 0 rows ("{CONTAINER}")  since://evt/8',
+            f'  ! schema_changed: 1 extractor selector matches 0 elements ("{CONTAINER}")'
+            "  since://evt/8",
             "after handling: ack(cursor=8)",
         ]
         assert not re.search(r"^  [-+~]", run.out, re.MULTILINE)  # no removals, no record events
@@ -341,9 +352,12 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         ):
             assert line.string.endswith(" · ok")
 
-        # 7. The layout is back but the session has expired (the page redirects to /login).
-        #    The source is already in error, so the runner appends no event (the digest stays
-        #    silent); status carries the new reason. Then the page is served normally again.
+        # 7. The layout is back but the session has expired (the page redirects to /login). The
+        #    source is already in error (layout broken), but "log in again" is a different cause
+        #    that only a human can fix (D24): the digest gets a `source_error`; a second collection
+        #    with the same message appends nothing; status carries the reason. Then the page is
+        #    served normally again and is the identical one that was there before the break: just
+        #    `source_recovered`, no layout change (D25).
         run = since("ack", "8")
         assert (run.code, run.out.strip()) == (0, "ok: agent=default cursor 7 -> 8")
         site.write("orders.html", orders_html(CANCELLED_ROWS, table_class=TABLE_CLASS))
@@ -351,27 +365,35 @@ def test_end_to_end_m2(site: Site, since_home_dir: Path) -> None:
         run = since("collect", "sps-portal")
         assert (run.code, run.out.strip()) == (1, 'sps-portal: collection failed: "login expired"')
         run = since("digest")
-        assert (run.code, run.out.strip()) == (
-            0,
-            "since · agent=default · no new events after cursor 8 · next_cursor=8",
-        )
+        assert run.code == 0
+        login_digest = run.out
+        assert run.lines == [
+            "since · agent=default · events 9-9 (1) · budget 800 · next_cursor=9",
+            NOTE,
+            "[high] sps-portal (1)",
+            '  ! source_error: "login expired"  since://evt/9',
+            "after handling: ack(cursor=9)",
+        ]
+        run = since("collect", "sps-portal")
+        assert (run.code, run.out.strip()) == (1, 'sps-portal: collection failed: "login expired"')
+        run = since("digest")
+        assert (run.code, run.out) == (0, login_digest)  # still the one event
         status = since("status")
         portal = only(r"^\[high\] sps-portal \(web\) · records 3 · ", status.lines)
         assert re.search(r' · error since \S+: "login expired"$', portal.string)
 
         site.logged_in = True
         run = since("collect", "sps-portal")
-        assert (run.code, run.out.strip()) == (0, "sps-portal: 2 events (seq 9-10)")
+        assert (run.code, run.out.strip()) == (0, "sps-portal: 1 events (seq 10-10)")
         run = since("digest")
         assert run.code == 0
         digest = run.lines
         assert digest[0] == "since · agent=default · events 9-10 (2) · budget 800 · next_cursor=10"
-        # The stored page structure is the broken one, so the restored layout is reported as a
-        # layout change (no selectors) besides the recovery; it ranks above the recovery.
         assert group(digest, "[high] sps-portal (2)") == [
-            "  ! schema_changed: page layout changed; extractor selectors still match",
+            '  ! source_error: "login expired" (recovered)',  # the digest marks errors that ended
             "  ^ source_recovered",
         ]
+        assert "schema_changed" not in run.out  # the identical page is not a layout change
         assert not re.search(r"^  [-+~]", run.out, re.MULTILINE)  # the cancellation is not repeated
         status = since("status")
         assert only(r"^\[high\] sps-portal \(web\) · records 3 · ", status.lines).string.endswith(

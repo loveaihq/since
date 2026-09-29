@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import NamedTuple
 
@@ -26,6 +26,7 @@ from since.config import Config, SourceConfig
 from since.diff import diff
 from since.importance import score
 from since.model import (
+    KIND_ADDED,
     KIND_BASELINE,
     KIND_REMOVED,
     KIND_SCHEMA_CHANGED,
@@ -39,9 +40,11 @@ from since.sources import (
     CollectError,
     Collector,
     CollectOutput,
+    LoginRequired,
     Window,
     get_collector,
     title_fields_for,
+    track_fields_for,
 )
 from since.store import SourceState, Store
 from since.timeutil import from_iso
@@ -302,14 +305,28 @@ def run_collection(
     extraction whose selectors match nothing (``broken``) is never diffed (see
     ``_store_success``), and a change of the fingerprint is reported as ``schema_changed``.
 
+    A ``LoginRequired`` failure (D24) is always surfaced: while the source is already in error, one
+    whose message differs from the current ``last_error`` still appends a ``source_error``.
+
+    The diff is limited to ``track_fields_for(cfg, collector)`` (D26): the configured
+    ``track_fields``, else the collector's default, else every field.
+
     If the stored state shows an attempt later than ``now`` (a newer run already committed), the
     result is dropped and ``CollectResult(superseded=True)`` returned (D15)."""
     try:
         title_fields = title_fields_for(cfg, collector)
+        track_fields = track_fields_for(cfg, collector)
         checked = _check_output(collector.collect(cfg))
     except Exception as exc:
-        return _store_failure(store, cfg, collector, now, _failure_message(exc))
-    return _store_success(store, cfg, collector, now, checked, title_fields)
+        return _store_failure(
+            store,
+            cfg,
+            collector,
+            now,
+            _failure_message(exc),
+            login=isinstance(exc, LoginRequired),
+        )
+    return _store_success(store, cfg, collector, now, checked, title_fields, track_fields)
 
 
 def _superseded(state: SourceState, now: datetime) -> bool:
@@ -328,23 +345,40 @@ def _superseded(state: SourceState, now: datetime) -> bool:
 
 
 def _store_failure(
-    store: Store, cfg: SourceConfig, collector: Collector, now: datetime, message: str
+    store: Store,
+    cfg: SourceConfig,
+    collector: Collector,
+    now: datetime,
+    message: str,
+    *,
+    login: bool = False,
 ) -> CollectResult:
     with store.transaction():
         state = _ensure_state(store, cfg, collector)
         if _superseded(state, now):
             return CollectResult(superseded=True)
-        return _apply_failure(store, cfg, state, now, message)
+        return _apply_failure(store, cfg, state, now, message, login=login)
 
 
 def _apply_failure(
-    store: Store, cfg: SourceConfig, state: SourceState, now: datetime, message: str
+    store: Store,
+    cfg: SourceConfig,
+    state: SourceState,
+    now: datetime,
+    message: str,
+    *,
+    login: bool = False,
 ) -> CollectResult:
     """Record a failed run (inside the run's transaction, after the staleness check): one
-    ``source_error`` if the source was not in error yet, and always the latest message/time."""
+    ``source_error`` if the source was not in error yet, and always the latest message/time.
+
+    ``login`` (a ``LoginRequired`` failure, D24) also appends a ``source_error`` when the source
+    is already in error but for another reason (``last_error`` differs from ``message``): what a
+    human has to do changed, and the agent must learn it. ``error_since`` stays as it was."""
     seqs: list[int] = []
     cols: dict[str, object] = {"last_error": message, "last_error_at": now}
-    if not state.in_error:
+    announce = not state.in_error or (login and state.last_error != message)
+    if announce:
         seqs.append(
             store.append_event(
                 cfg.id,
@@ -354,6 +388,7 @@ def _apply_failure(
                 detail={"error": message},
             )
         )
+    if not state.in_error:
         cols["in_error"] = True
         cols["error_since"] = now
     store.update_source_state(cfg.id, **cols)
@@ -378,17 +413,17 @@ def _apply_broken(
     trusted: no diff, snapshot and record count untouched, so a layout change never produces a
     wave of ``removed``. The source goes (or stays) in error with ``message``; the first
     ``schema_changed`` event comes instead of a ``source_error``, and another one only when the
-    ``(fingerprint, sorted broken)`` pair differs from the stored one, so a lasting broken state
-    is announced once."""
+    sorted ``broken`` selectors differ from the stored ones, so a lasting broken state is announced
+    once. The stored ``fingerprint`` is NOT touched (D25): it stays the last *good* one, so a page
+    that comes back unchanged recovers with just ``source_recovered``."""
     seqs: list[int] = []
     pair = sorted(checked.broken)
     cols: dict[str, object] = {
         "last_error": message,
         "last_error_at": now,
-        "fingerprint": checked.fingerprint,
         "broken": pair,
     }
-    if (checked.fingerprint, pair) != (state.fingerprint, state.broken):
+    if pair != state.broken:
         seqs.append(
             store.append_event(
                 cfg.id,
@@ -412,6 +447,7 @@ def _store_success(
     now: datetime,
     checked: _Checked,
     title_fields: list[str],
+    track_fields: list[str] | None,
 ) -> CollectResult:
     """Store a valid result. With a page fingerprint (D18):
 
@@ -419,7 +455,8 @@ def _store_success(
       baseline an empty page);
     - broken selectors, baselined: :func:`_apply_broken`;
     - no broken selectors: the fingerprint is stored (with ``broken`` cleared); if the stored
-      one differed, a ``schema_changed`` with no selectors precedes the normal diff."""
+      one (the last good one, D25) differed, a ``schema_changed`` with no selectors precedes the
+      normal diff."""
     seqs: list[int] = []
     fingerprint = checked.fingerprint
     with store.transaction():
@@ -476,7 +513,7 @@ def _store_success(
                         detail={"selectors": []},
                     )
                 )
-            diff_seqs, count = _store_diff(store, cfg, now, checked, title_fields)
+            diff_seqs, count = _store_diff(store, cfg, now, checked, title_fields, track_fields)
             seqs.extend(diff_seqs)
             cols["record_count"] = count
         store.update_source_state(cfg.id, **cols)
@@ -526,9 +563,11 @@ def _store_diff(
     now: datetime,
     checked: _Checked,
     title_fields: list[str],
+    track_fields: list[str] | None,
 ) -> tuple[list[int], int]:
     """Diff against the stored snapshot, append the events and bring the snapshot up to date.
-    Returns the event seqs and the number of records present afterwards.
+    Returns the event seqs and the number of records present afterwards. The diff is limited to
+    ``track_fields`` (``None`` = all fields; D26).
 
     Added/modified/removed events carry ``detail["title"]``: the title fields of the new record
     (added/modified) or of the last known record (removed).
@@ -546,7 +585,9 @@ def _store_diff(
     aged = _aged_out(comparable, {r.key for r in records}, checked.window)
     if aged:
         comparable = {key: rec for key, rec in comparable.items() if key not in aged}
-    drafts = diff(comparable, records, cfg.track_fields)
+    drafts = diff(comparable, records, track_fields)
+    if cfg.track_fields is None:  # collector-default track fields don't decorate `+` lines (D26)
+        drafts = [replace(d, changes=[]) if d.kind == KIND_ADDED else d for d in drafts]
     seqs = [
         store.append_event(
             cfg.id,

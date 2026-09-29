@@ -69,8 +69,8 @@ Event line bodies (`sym text`), L = record label:
 - baseline: `= baseline: N records`
 - source_error: `! source_error: "msg"`
 - source_recovered: `^ source_recovered`
-- schema_changed: `! schema_changed: 1 extractor selector matches 0 rows ("sel")` /
-  `! schema_changed: 2 extractor selectors match 0 rows ("a", "b")`
+- schema_changed: `! schema_changed: 1 extractor selector matches 0 elements ("sel")` /
+  `! schema_changed: 2 extractor selectors match 0 elements ("a", "b")`
 
 Digest line = two spaces + body + two spaces + `since://evt/<seq>`.
 In `since` digests only, a `source_error` whose source has a later `source_recovered` among the events after

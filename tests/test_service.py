@@ -830,7 +830,7 @@ def test_get_evt_schema_changed_lists_selectors_one_per_line(store: Store, svc: 
         importance=15,
     )
     assert svc.get(f"since://evt/{seq}").splitlines()[2:] == [
-        "selectors matching 0 rows:",
+        "selectors matching 0 elements:",
         '"table#orders tbody tr"',
         '"td[class=\\"x\\"]"',
     ]
@@ -1855,7 +1855,7 @@ def test_page_structure_events_from_real_runs_reach_digest_get_and_status(
     assert digest.splitlines()[2:] == [
         "[high] portal (3)",
         "  ! schema_changed: page layout changed; extractor selectors still match  since://evt/2",
-        '  ! schema_changed: 1 extractor selector matches 0 rows ("td:nth-child(4)")'
+        '  ! schema_changed: 1 extractor selector matches 0 elements ("td:nth-child(4)")'
         "  since://evt/3",
         "  = baseline: 1 record  since://evt/1",
         "after handling: ack(cursor=3)",
@@ -1864,7 +1864,7 @@ def test_page_structure_events_from_real_runs_reach_digest_get_and_status(
         "page layout changed; extractor selectors still match"
     ]
     assert svc.get("since://evt/3").splitlines()[2:] == [
-        "selectors matching 0 rows:",
+        "selectors matching 0 elements:",
         '"td:nth-child(4)"',
     ]
     (line,) = [ln for ln in svc.status().splitlines() if ln.startswith("[high] portal")]

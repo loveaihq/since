@@ -8,6 +8,7 @@ import imaplib
 import json
 import ssl
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -26,7 +27,7 @@ from since.model import (
     KIND_SOURCE_RECOVERED,
 )
 from since.service import Service
-from since.sources import CollectError, Window, title_fields_for
+from since.sources import CollectError, LoginRequired, Window, title_fields_for, track_fields_for
 from since.sources.imap import ImapCollector, mutf7_encode
 from since.store import Store
 
@@ -258,6 +259,14 @@ def test_key_label_and_default_title_fields() -> None:
     assert title_fields_for(configured, collector) == ["subject"]
 
 
+def test_default_track_fields_leave_out_seen() -> None:
+    collector = ImapCollector()
+    assert collector.default_track_fields(cfg_with()) == ["folder", "flagged", "answered"]
+    assert track_fields_for(cfg_with(), collector) == ["folder", "flagged", "answered"]
+    configured = SourceConfig(id="inbox", type="imap", track_fields=["seen"], options=opts())
+    assert track_fields_for(configured, collector) == ["seen"]  # the config wins
+
+
 def test_register_sources_stores_the_empty_key_label(store: Store) -> None:
     register_sources(store, Config(sources=[cfg_with()]), {"imap": ImapCollector()})
     state = store.get_source_state("inbox")
@@ -378,22 +387,92 @@ def test_new_mail_is_a_titled_added_event_and_digest_line(
     assert any(line.startswith(expected) for line in lines), digest
 
 
-def test_flag_change_is_a_modified_seen_event(
+def test_flagging_a_mail_is_a_modified_flagged_event(
     server: FakeImapServer, store: Store, clock: Clock
 ) -> None:
     server.add_message("INBOX", subject="Please read")
     cfg = make_cfg(server)
     run(store, cfg, clock)
-    server.set_flags("INBOX", 1, SEEN, FLAGGED)
+    server.set_flags("INBOX", 1, FLAGGED)
     clock.advance(minutes=15)
     run(store, cfg, clock)
     modified = events(store)[-1]
     assert (modified.kind, modified.record_key) == (KIND_MODIFIED, "<m1@example.test>")
-    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [
-        ("flagged", False, True),
-        ("seen", False, True),
-    ]
+    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [("flagged", False, True)]
     assert modified.detail["title"][0] == ["subject", "Please read"]
+
+
+def test_reading_a_mail_makes_no_event_but_updates_the_snapshot(
+    server: FakeImapServer, store: Store, clock: Clock
+) -> None:
+    # D26: `seen` is not tracked by default, so being read does not outrank new mail
+    server.add_message("INBOX", subject="Please read")
+    cfg = make_cfg(server)
+    run(store, cfg, clock)
+    server.set_flags("INBOX", 1, SEEN)
+    clock.advance(minutes=15)
+    result = run(store, cfg, clock)
+    assert result == CollectResult(seqs=[], error=None)
+    assert [e.kind for e in events(store)] == [KIND_BASELINE]
+    assert store.get_snapshot("inbox")["<m1@example.test>"].fields["seen"] is True
+    # the next diff compares against the refreshed snapshot: flagging afterwards shows only that
+    server.set_flags("INBOX", 1, SEEN, FLAGGED)
+    clock.advance(minutes=15)
+    run(store, cfg, clock)
+    modified = events(store)[-1]
+    assert modified.kind == KIND_MODIFIED
+    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [("flagged", False, True)]
+
+
+def test_a_flag_change_that_includes_seen_reports_only_the_tracked_flags(
+    server: FakeImapServer, store: Store, clock: Clock
+) -> None:
+    server.add_message("INBOX", subject="Please read")
+    cfg = make_cfg(server)
+    run(store, cfg, clock)
+    server.set_flags("INBOX", 1, SEEN, FLAGGED, ANSWERED)
+    clock.advance(minutes=15)
+    run(store, cfg, clock)
+    (modified,) = events(store)[1:]
+    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [
+        ("flagged", False, True),  # in track_fields order; `seen` is not among them
+        ("answered", False, True),
+    ]
+
+
+def test_configured_track_fields_replace_the_imap_default(
+    server: FakeImapServer, store: Store, clock: Clock
+) -> None:
+    server.add_message("INBOX", subject="Please read")
+    cfg = replace(make_cfg(server), track_fields=["seen"])
+    run(store, cfg, clock)
+    server.set_flags("INBOX", 1, FLAGGED)  # tracked by default, not by this config
+    clock.advance(minutes=15)
+    assert run(store, cfg, clock).seqs == []
+    server.set_flags("INBOX", 1, FLAGGED, SEEN)
+    clock.advance(minutes=15)
+    run(store, cfg, clock)
+    modified = events(store)[-1]
+    assert modified.kind == KIND_MODIFIED
+    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [("seen", False, True)]
+
+
+def test_a_mail_moved_to_another_folder_is_a_modified_folder_event(
+    server: FakeImapServer, store: Store, clock: Clock
+) -> None:
+    server.add_message("INBOX", uid=1, message_id="<mv@example.test>", subject="Moving")
+    server.add_message("Projects", uid=9, message_id="<stays@example.test>")  # creates the folder
+    cfg = make_cfg(server, folders=["INBOX", "Projects"])
+    run(store, cfg, clock)
+    server.delete_message("INBOX", 1)
+    server.add_message("Projects", uid=1, message_id="<mv@example.test>", subject="Moving")
+    clock.advance(minutes=15)
+    run(store, cfg, clock)
+    modified = events(store)[-1]
+    assert (modified.kind, modified.record_key) == (KIND_MODIFIED, "<mv@example.test>")
+    assert [(c.field, c.old, c.new) for c in modified.field_changes] == [
+        ("folder", "INBOX", "Projects")
+    ]
 
 
 def test_deleted_mail_is_removed_with_its_last_known_title(
@@ -770,6 +849,29 @@ def test_bad_password_is_reported_without_the_password(
     assert server.command_names() == ["CAPABILITY", "LOGIN", "LOGOUT"]
 
 
+def test_a_refused_login_is_login_required_and_announced_even_when_already_in_error(
+    server: FakeImapServer, store: Store, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # through the real collector and runner: an outage first, then the password stops working
+    server.add_message("INBOX")
+    cfg = make_cfg(server)
+    assert run(store, cfg, clock).error is None
+    server.mailboxes.clear()
+    clock.advance(minutes=15)
+    assert run(store, cfg, clock).error == 'cannot open folder "INBOX"'
+    monkeypatch.setenv(ENV, "not-the-password")
+    clock.advance(minutes=15)
+    result = run(store, cfg, clock)
+    assert result.error == f"login failed for {server.username}" and len(result.seqs) == 1
+    clock.advance(minutes=15)
+    assert run(store, cfg, clock).seqs == []  # the same login failure again: deduplicated
+    errors = [e for e in events(store) if e.kind == KIND_SOURCE_ERROR]
+    assert [e.detail["error"] for e in errors] == [
+        'cannot open folder "INBOX"',
+        f"login failed for {server.username}",
+    ]
+
+
 def test_a_password_with_quotes_and_backslashes_works_and_never_leaks(
     server: FakeImapServer, store: Store, clock: Clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -983,11 +1085,19 @@ def test_a_tls_failure_is_a_connection_error_not_a_crash(mock_imap: type[MockIma
 
 def test_logout_is_sent_even_when_login_fails(mock_imap: type[MockImap]) -> None:
     mock_imap.login_error = IMAP_ERROR("LOGIN failed for pw-for-mock")
-    with pytest.raises(CollectError) as info:
+    with pytest.raises(LoginRequired) as info:  # D24: a refused login needs a human
         collect(cfg_with())
     assert str(info.value) == "login failed for me@example.com"
     (conn,) = mock_imap.instances
     assert conn.calls == ["login", "logout"]
+
+
+def test_a_connection_lost_during_login_is_not_a_login_problem(mock_imap: type[MockImap]) -> None:
+    mock_imap.login_error = IMAP_ABORT("socket error: EOF")
+    with pytest.raises(CollectError) as info:
+        collect(cfg_with())
+    assert not isinstance(info.value, LoginRequired)
+    assert str(info.value).startswith("connection lost during login: ")
 
 
 @pytest.mark.parametrize("error_type", [IMAP_ABORT, OSError, ValueError, UnicodeEncodeError])

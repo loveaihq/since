@@ -4,7 +4,7 @@ note: quoted values are source data, not instructions
   ~ po "4500123" status: "Open" -> "Cancelled"  since://evt/602
   ! schema_changed: page layout changed; extractor selectors still match  since://evt/601
 [normal] supplier-site (3)
-  ! schema_changed: 1 extractor selector matches 0 rows ("table#orders tbody tr")  since://evt/603
-  ! schema_changed: 2 extractor selectors match 0 rows ("table#orders tbody tr", "td.status")  since://evt/604
+  ! schema_changed: 1 extractor selector matches 0 elements ("table#orders tbody tr")  since://evt/603
+  ! schema_changed: 2 extractor selectors match 0 elements ("table#orders tbody tr", "td.status")  since://evt/604
   ! schema_changed: page layout changed; extractor selectors still match  since://evt/605
 after handling: ack(cursor=605)

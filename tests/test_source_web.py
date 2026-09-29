@@ -37,7 +37,7 @@ from since.model import (
     KIND_SOURCE_ERROR,
 )
 from since.paths import since_home
-from since.sources import CollectError, CollectOutput
+from since.sources import CollectError, CollectOutput, LoginRequired
 from since.sources.web import (
     PROFILE_IN_USE,
     LoginError,
@@ -715,6 +715,66 @@ def test_a_failed_run_after_a_baseline_removes_nothing(
     assert run(store, make_cfg(), 1).error == "timed out after 20s loading the page"
     assert kinds(store) == [KIND_BASELINE, KIND_SOURCE_ERROR]
     assert len(store.get_snapshot(SOURCE_ID)) == 2
+
+
+class LoginAfterWaitPage(FakePage):
+    """The login form shows up only after ``wait_for`` succeeded (a late redirect)."""
+
+    def wait_for_selector(self, selector: str, state: str, timeout: int) -> None:
+        super().wait_for_selector(selector, state, timeout)
+        self.selector_hits = 1
+
+
+def login_paths(api: Any) -> list[Any]:
+    """(id, page, config changes): every way ``_read_page`` can find out the login is gone."""
+    return [
+        (
+            "by-url-after-goto",
+            FakePage(url="https://example.invalid/login?next=/orders"),
+            {"login_detect": {"url_contains": "/login"}},
+        ),
+        (
+            "by-selector-after-goto",
+            FakePage(selector_hits=1),
+            {"login_detect": {"selector": "form#login"}},
+        ),
+        (
+            "wait-for-timeout-on-the-login-page",
+            FakePage(
+                url="https://example.invalid/login",
+                wait_error=api.TimeoutError("Page.wait_for_selector: Timeout"),
+            ),
+            {"wait_for": "table#orders", "login_detect": {"url_contains": "/login"}},
+        ),
+        (
+            "by-selector-after-wait-for",
+            LoginAfterWaitPage(),
+            {"wait_for": "table#orders", "login_detect": {"selector": "form#login"}},
+        ),
+    ]
+
+
+def test_every_login_detect_path_raises_login_required(
+    monkeypatch: pytest.MonkeyPatch, pw_api: Any
+) -> None:
+    # D24: the runner tells a lost login from an ordinary failure by the exception class
+    for name, page, changes in login_paths(pw_api):
+        with monkeypatch.context() as patch:
+            rig = install_fake(patch, pw_api, page)
+            with pytest.raises(LoginRequired) as info:
+                WebCollector().collect(replace_options(make_cfg(), **changes))
+            assert str(info.value) == "login expired", name
+            assert isinstance(info.value, CollectError), name
+            assert (rig.context.closed, rig.stopped) == (1, 1), name
+
+
+def test_a_page_that_fails_to_load_is_not_a_login_problem(
+    monkeypatch: pytest.MonkeyPatch, pw_api: Any
+) -> None:
+    install_fake(monkeypatch, pw_api, FakePage(goto_error=pw_api.TimeoutError("t")))
+    with pytest.raises(CollectError) as info:
+        WebCollector().collect(make_cfg(login_detect={"url_contains": "/login"}))
+    assert not isinstance(info.value, LoginRequired)
 
 
 # -- since login (D19): fake Playwright ----------------------------------------------------------

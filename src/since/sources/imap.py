@@ -24,9 +24,13 @@ once: first by folder order in the config, then by ascending UID. The result car
 ``Window("date", <00:00 UTC of the SINCE day>)`` so mails aging out of the window are dropped
 without a ``removed`` event (D21).
 
+Default ``track_fields`` (D26): ``folder``, ``flagged``, ``answered``. A mail merely being read
+(``seen``) makes no event; a ``track_fields`` option in the config replaces the default.
+
 Errors reaching the stored ``source_error`` never contain the password: the messages are fixed
-texts (``login failed for <username>``) or scrubbed reasons of the underlying exception. A folder
-that EXAMINE rejects fails the whole run (silently skipping it would make its mails look removed).
+texts (``login failed for <username>``, raised as ``LoginRequired``, D24) or scrubbed reasons of
+the underlying exception. A folder that EXAMINE rejects fails the whole run (silently skipping it
+would make its mails look removed).
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ from typing import Any
 
 from since.config import ConfigError, SourceConfig
 from since.model import Record, Scalar
-from since.sources import CollectError, CollectOutput, Window
+from since.sources import CollectError, CollectOutput, LoginRequired, Window
 from since.timeutil import to_iso
 
 _ALLOWED_OPTIONS = (
@@ -237,6 +241,12 @@ class ImapCollector:
     def default_title_fields(self, cfg: SourceConfig) -> list[str]:
         return ["subject", "from"]
 
+    def default_track_fields(self, cfg: SourceConfig) -> list[str]:
+        """A mail merely being read (``seen``) is not news and must not outrank new mail (D26);
+        ``flagged`` / ``answered`` and a move to another folder are. ``track_fields`` in the
+        config replaces this."""
+        return ["folder", "flagged", "answered"]
+
     def collect(self, cfg: SourceConfig) -> CollectOutput:
         try:
             s = _settings(cfg)
@@ -342,7 +352,7 @@ def _login(conn: imaplib.IMAP4, s: _Settings, password: str, secrets: list[str])
         raise CollectError(f"connection lost during login: {_reason(exc, secrets)}") from None
     except imaplib.IMAP4.error:
         # Never echo the server's text: it is untrusted and could quote what we sent.
-        raise CollectError(f"login failed for {s.username}") from None
+        raise LoginRequired(f"login failed for {s.username}") from None
 
 
 def _logout(conn: imaplib.IMAP4 | None) -> None:

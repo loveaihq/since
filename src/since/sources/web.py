@@ -59,7 +59,7 @@ from since.collect import MAX_FIELD_NAME_CHARS, _field_name_allowed
 from since.config import ConfigError, SourceConfig
 from since.model import Record
 from since.paths import since_home
-from since.sources import CollectError, CollectOutput
+from since.sources import CollectError, CollectOutput, LoginRequired
 
 _KNOWN_OPTIONS = (
     "url",
@@ -74,6 +74,8 @@ _KNOWN_OPTIONS = (
 _LOGIN_KEYS = ("url_contains", "selector")
 _EXTRACT_KEYS = ("rows", "key", "fields", "container")
 _CHANNELS = ("msedge", "chrome")
+
+LOGIN_EXPIRED = "login expired"  # the message of the ``LoginRequired`` a login_detect hit raises
 
 DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 300
@@ -456,18 +458,18 @@ def _read_page(api: Any, page: Any, opts: _Options) -> Any:
     except api.Error as exc:
         raise CollectError(f"cannot load the page: {_describe(exc, opts.url)}") from None
     if _logged_out(page, opts):
-        raise CollectError("login expired")
+        raise LoginRequired(LOGIN_EXPIRED)
     if opts.wait_for is not None:
         try:
             page.wait_for_selector(opts.wait_for, state="attached", timeout=ms)
         except api.TimeoutError:
             if _logged_out(page, opts):  # the login page does not have the awaited element
-                raise CollectError("login expired") from None
+                raise LoginRequired(LOGIN_EXPIRED) from None
             raise CollectError(
                 f"timed out after {opts.timeout_s}s waiting for selector {opts.wait_for[:120]!r}"
             ) from None
         if _logged_out(page, opts):
-            raise CollectError("login expired")
+            raise LoginRequired(LOGIN_EXPIRED)
     argument = {
         "container": opts.container,
         "rows": opts.rows,
