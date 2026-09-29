@@ -41,3 +41,24 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   (cron / Task Scheduler) is judged stale by the normal 2x-schedule rule instead of always "not running".
 - **Note for M2 (imap):** Message-IDs repeat in practice (same mail in several folders, or missing). D4 would then
   fail the source permanently; the imap key must be designed around this (e.g. folder + UID validity + UID).
+- **D17 (M2) Record titles.** Core option `title_fields` (collector default: imap subject+from,
+  changedetection title). A Message-ID or watch uuid means nothing to an agent; the title is stored in the
+  event detail at creation, so removed records keep a readable label.
+- **D18 (M2) Page structure tracking.** The fingerprint skips the `rows` subtrees (an emptied table is data,
+  not a layout change). Broken extraction (container/rows/field selectors matching nothing) never diffs — it
+  behaves like a failed run whose first event is `schema_changed` instead of `source_error` — so a layout
+  change can never produce a wave of `removed`. A layout-only change (all selectors still match) is reported
+  once as `schema_changed` with no selectors, then diffed normally.
+- **D19 (M2) `since login <source_id>`.** CLAUDE.md says the human logs in once manually into the persistent
+  profile; this command opens that profile headed at the source URL and waits for the window to close. It
+  never fills anything in (auto-login stays a non-goal). It is the only Playwright use outside the daemon.
+- **D20 (M2) imap key and dedupe.** Key = Message-ID; a mail seen in several folders/labels (normal on Gmail)
+  is kept once (first by folder order, then UID); missing Message-ID → `uid:<folder>/<uidvalidity>/<uid>`.
+  Read-only: EXAMINE + BODY.PEEK only. Password via `password_env` (for Google Workspace an app password);
+  OAuth and message body snippets are out of M2.
+- **D21 (M2) Collection windows.** Sources that only look back N days (imap `since_days`) report a window;
+  records that age out of it leave the snapshot without a `removed` event.
+- **D22 (M2) changedetection fields.** `last_checked` is not a field (it changes on every check and would
+  flood the digest); the latest snapshot text is, so a watch change shows as `text changed (+a/-b chars)`.
+- **D23 (M2) Browser.** Bundled Playwright Chromium by default; `browser_channel: msedge|chrome` uses an
+  installed browser instead (no extra download on Windows, where Edge is always present).
