@@ -23,3 +23,5 @@ Small spec changes/clarifications made by the architect. Direction changes go to
 - **D10 (M1) Long text in `get`.** "Never shown in full" applies to diffs/digests (they only report
   `+a/-b chars`). `get(since://rec/…)` is a deliberate drill-down and shows field values capped at 1000 chars.
 - **D11 (M1) Digest lines are not column-aligned** (two spaces before the handle). Padding costs tokens.
+- **D12 (M1) Target `mcp` 2.x (`mcp>=2.2,<3`).** 2.x is the current major; v1's `FastMCP` is
+  `mcp.server.mcpserver.MCPServer` there. A new project should not start on the previous major.

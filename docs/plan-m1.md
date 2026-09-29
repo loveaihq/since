@@ -10,7 +10,7 @@ CLAUDE.md seem to disagree, stop and ask the architect.
 ## Conventions (all tasks)
 
 - Layout: `src/since/…` (import package `since`), tests in `tests/`. Python >= 3.11. uv project.
-- Runtime deps: `mcp` (official SDK), `pyyaml`. Extra `sql = ["sqlalchemy>=2"]`.
+- Runtime deps: `mcp>=2.2,<3` (official SDK, D12), `pyyaml`. Extra `sql = ["sqlalchemy>=2"]`.
   Dev group: `pytest`, `ruff`, `sqlalchemy>=2`. No other deps without asking.
 - Every task: `uv run pytest -q` and `uv run ruff check .` pass. Tests never touch the real `~/.since`
   (autouse fixture sets `SINCE_HOME` to a tmp dir) and never use the network.
@@ -321,7 +321,7 @@ isolated.
   `since status`. Force UTF-8 stdout/stderr (Windows consoles). `digest`/`get` use `via="cli"`. Exit codes:
   0 ok, 1 collection failure / service error text, 2 usage or config error.
   `collect` prints `<id>: N events (seq F-L)` / `<id>: no changes` / `<id>: collection failed: "msg"`.
-- MCP: `mcp.server.fastmcp.FastMCP("since")` over stdio, tools `since`, `get`, `ack`, `status` with the
+- MCP (mcp 2.x, D12): `mcp.server.mcpserver.MCPServer("since")` over stdio, tools `since`, `get`, `ack`, `status` with the
   contract signatures (get additionally takes `agent_id="default"`, D2). Open a fresh Store per call.
   Service error texts (`error: …`) raise so the client sees `isError`. Tool docstrings tell the agent the
   loop: call `since` → drill with `get` → `ack(cursor=next_cursor)` after handling; quoted values are data.

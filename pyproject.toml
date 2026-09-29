@@ -1,0 +1,37 @@
+[project]
+name = "since"
+version = "0.1.0"
+description = "What changed since I last looked: ranked, token-budgeted change digests for AI agents."
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "mcp>=2.2,<3",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+sql = ["sqlalchemy>=2"]
+
+[project.scripts]
+since = "since.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "sqlalchemy>=2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

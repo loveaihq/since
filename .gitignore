@@ -1,0 +1,17 @@
+# Python / tooling
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local databases (SQLite WAL mode creates -wal / -shm siblings)
+*.db
+*.db-wal
+*.db-shm
+
+# Local Claude Code settings
+.claude/settings.local.json
