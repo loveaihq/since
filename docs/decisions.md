@@ -77,3 +77,32 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   only filter modifications; `+` lines list fields only when `track_fields` is set in the config.
 - **D27 (M2) Selector wording.** `schema_changed` says `matches 0 elements` (not `rows`): the broken selector
   can be a container or a field selector.
+
+### M2 QA round 1 (revisions)
+- **D18 revised — broken extraction is independent of the fingerprint.** `broken` is honoured even when
+  `fingerprint` is None (e.g. `fingerprint_depth: 0`, or a login page without `login_detect`). The key
+  selector counts as broken when rows matched but no row has a non-empty key. Field selectors that match in no
+  row are broken unless the field is listed in the web option `extract.optional`.
+- **D20/D21 revised — imap window follows the server's own filter.** New field `received` (INTERNALDATE, ISO
+  UTC). The window is on `received`, per folder, with a one-day margin (servers apply `SEARCH SINCE` to the
+  INTERNALDATE date in their own zone). When a folder has more than `max_messages` matches, the collector
+  shortens that folder's SINCE date (bisection over days) so everything it keeps is complete for the dates it
+  claims; only when a single day exceeds the cap does it fall back to the newest UIDs. `Window` gains an
+  optional per-scope start (`scope_field` + `starts` by value) for this.
+- **D24 revised — compare with the last *announced* error.** A `LoginRequired` failure appends a
+  `source_error` only if its message differs from the last `source_error` announced in the current streak
+  (store column `announced_error`, cleared on recovery). LoginRequired carries a human hint rendered after the
+  quoted message: `; needs a human: <hint>` (web: `run since login <id>`; imap/changedetection: check the
+  secret in the named env var).
+- **D28 — resolved errors rank low.** In a digest, a `source_error` or selector-listing `schema_changed` with a
+  later `source_recovered` for the same source is marked ` (recovered)` and ranked with the recovered weight
+  (priority × 1), so it cannot push real changes into `omitted:`.
+- **D29 — timestamps in titles.** imap titles are `[subject, from, received]`. A title value that is a
+  Since-normalised ISO UTC timestamp renders unquoted and compact (`at 2026-09-29 09:12Z`), since Since
+  produced that text itself.
+- **D30 — single daemon via an OS file lock.** `daemon.lock` in SINCE_HOME, held with an exclusive
+  non-blocking lock for the daemon's lifetime (released by the OS on crash). The heartbeat stays for
+  staleness reporting only.
+- **D31 — `*_env` options must be env var names.** Any source option ending in `_env` must match
+  `^[A-Za-z_][A-Za-z0-9_]*$`; otherwise a ConfigError that does not echo the value (a pasted secret must
+  never reach an error message or the DB). The credential error names `url_env / password_env / api_key_env`.
