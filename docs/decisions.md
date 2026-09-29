@@ -63,3 +63,16 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   flood the digest); the latest snapshot text is, so a watch change shows as `text changed (+a/-b chars)`.
 - **D23 (M2) Browser.** Bundled Playwright Chromium by default; `browser_channel: msedge|chrome` uses an
   installed browser instead (no extra download on Windows, where Edge is always present).
+- **D24 (M2) Login problems are always surfaced.** Collectors raise `LoginRequired` (a CollectError) for
+  errors only a human can fix: web `login expired`, imap `login failed for …`, changedetection
+  `API key rejected`. While a source is already in error, a LoginRequired failure whose message differs from
+  the current `last_error` still appends a `source_error` (plain errors stay deduplicated). An agent that saw
+  "layout broken" must learn that the cause is now "log in again".
+- **D25 (M2) Broken extraction doesn't move the good fingerprint.** In the broken state only the sorted broken
+  selectors are compared (dedupe) and the stored fingerprint stays the last *good* one, so a page that comes
+  back unchanged recovers with just `source_recovered` (no spurious "layout changed").
+- **D26 (M2) Collector default `track_fields`.** Like titles (D17), a collector may supply default
+  `track_fields`; imap uses `[folder, flagged, answered]`, so a mail merely being read (`seen`) no longer
+  creates an event that outranks new mail. Config `track_fields` still overrides.
+- **D27 (M2) Selector wording.** `schema_changed` says `matches 0 elements` (not `rows`): the broken selector
+  can be a container or a field selector.
