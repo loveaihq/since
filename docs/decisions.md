@@ -106,3 +106,18 @@ Small spec changes/clarifications made by the architect. Direction changes go to
 - **D31 — `*_env` options must be env var names.** Any source option ending in `_env` must match
   `^[A-Za-z_][A-Za-z0-9_]*$`; otherwise a ConfigError that does not echo the value (a pasted secret must
   never reach an error message or the DB). The credential error names `url_env / password_env / api_key_env`.
+
+### M3
+- **D32 (M3) `since ui` is read-only, localhost-only, no JavaScript.** It shows untrusted source data, so every
+  value is HTML-escaped, a strict CSP forbids scripts, and the Host header is checked (DNS rebinding).
+- **D33 (M3) Benchmark world.** Fixed seed and fixed simulated dates; "needing attention" is defined by four
+  explicit rules in the task prompt and the answer key is computed from those rules, so recall/precision are
+  objective. Sources: mail, PO table, portal (changedetection is not needed for the task).
+- **D34 (M3) Arm A gets its own notes from the last look.** An agent without any memory cannot know what
+  changed; CLAUDE.md's premise is that agents re-read and diff inside their context. Arm A therefore gets the
+  PO table and portal text as of its last look (like notes it saved), plus raw access to everything now.
+- **D35 (M3) Measurement.** Headless Claude Code with only the arm's MCP server (`--tools ""`,
+  `--strict-mcp-config`), a per-run `--max-budget-usd` cap; input tokens include cached input (reported
+  separately too); refs graded after normalisation; duplicates counted once.
+- **D36 (M3) Benchmark spend.** Default 3 runs per arm on Sonnet with a $3 per-run cap; the harness never
+  runs more than the requested runs.
