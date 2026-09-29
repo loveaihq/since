@@ -1,0 +1,64 @@
+"""Source collectors: the ``Collector`` protocol, ``CollectError`` and a lazy type registry.
+
+Collectors never touch the database and never call an LLM; they turn a source config into a list
+of :class:`~since.model.Record`. The runner (``since.collect``) does everything else. Concrete
+collectors are imported on demand so that e.g. SQLAlchemy is only needed when a ``sql`` source is
+actually used.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import Protocol
+
+from since.config import SourceConfig
+from since.model import SOURCE_TYPES, Record
+
+
+class CollectError(Exception):
+    """A collection failed for a reason worth showing to the human/agent.
+
+    ``str(exc)`` is stored as the ``source_error`` message, so it must not contain secrets."""
+
+
+class Collector(Protocol):
+    """One implementation per source type."""
+
+    type_name: str
+
+    def validate(self, cfg: SourceConfig) -> None:
+        """Check the type-specific options in ``cfg.options``; raise ``ConfigError`` if invalid.
+        Must not do I/O (no connections, no filesystem reads)."""
+        ...
+
+    def key_label(self, cfg: SourceConfig) -> str:
+        """Human label for the record key in digests (``po_no`` -> ``po_no "4500123"``);
+        ``""`` when the quoted key alone is clear enough."""
+        ...
+
+    def collect(self, cfg: SourceConfig) -> list[Record]:
+        """Read the source now. Raise ``CollectError`` (or anything else) on failure; a failed
+        collection must never be reported as an empty list."""
+        ...
+
+
+# source type -> "module:Class". Modules are imported lazily by ``get_collector``.
+REGISTRY: dict[str, str] = {
+    "dir": "since.sources.dir:DirCollector",
+    "sql": "since.sources.sql:SqlCollector",
+}
+
+
+def get_collector(type_name: str) -> Collector:
+    """Return a new collector for a source type.
+
+    ``NotImplementedError`` for types that exist but have no collector yet (imap / web /
+    changedetection); ``ValueError`` for a type Since does not know at all."""
+    target = REGISTRY.get(type_name)
+    if target is None:
+        if type_name in SOURCE_TYPES:
+            raise NotImplementedError(f"source type '{type_name}' is not implemented yet")
+        raise ValueError(f"unknown source type '{type_name}'")
+    module_name, _, class_name = target.partition(":")
+    cls = getattr(importlib.import_module(module_name), class_name)
+    return cls()
