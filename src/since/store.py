@@ -265,7 +265,18 @@ class Store:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    def _schema_is_current(self) -> bool:
+        """True if the ``meta`` table exists and holds the current ``schema_version``. Plain reads
+        only: an open must not take the write lock when there is nothing to create (a
+        long-running writer would otherwise block every read-only command)."""
+        try:
+            return self.get_meta("schema_version") == str(SCHEMA_VERSION)
+        except sqlite3.OperationalError:  # no such table: a new database
+            return False
+
     def _init_schema(self) -> None:
+        if self._schema_is_current():
+            return
         with self.transaction():
             for stmt in _SCHEMA:
                 self._conn.execute(stmt)

@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
-from since.model import Event
+from since.model import KIND_SOURCE_ERROR, KIND_SOURCE_RECOVERED, Event
 from since.render import NOTE_LINE, batch_handle, estimate_tokens, event_body, evt_handle
 from since.sanitize import DIGEST_CAP
 
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 MIN_BUDGET = 200
 UNKNOWN_PRIORITY = "?"
+RECOVERED_SUFFIX = " (recovered)"
 
 
 class _Digest:
@@ -48,6 +49,13 @@ class _Digest:
             if e.seq > cursor and (source_filter is None or e.source_id == source_filter)
         ]
         self.ranked = sorted(selected, key=lambda e: (-e.importance, e.seq))
+        # A source_error is marked " (recovered)" once the same source has a later
+        # source_recovered among the digest's events, shown or not. Only digest lines carry it.
+        self.recovered_seq: dict[str, int] = {}
+        for e in selected:
+            if e.kind == KIND_SOURCE_RECOVERED:
+                latest = self.recovered_seq.get(e.source_id, 0)
+                self.recovered_seq[e.source_id] = max(latest, e.seq)
         self.lines = [self._event_line(e) for e in self.ranked]
 
         self.first = min((e.seq for e in self.ranked), default=0)
@@ -61,6 +69,9 @@ class _Digest:
         state = self.sources.get(event.source_id)
         key_label = state.key_label if state is not None else ""
         body = event_body(event, key_label, DIGEST_CAP)
+        if event.kind == KIND_SOURCE_ERROR:
+            if self.recovered_seq.get(event.source_id, 0) > event.seq:
+                body += RECOVERED_SUFFIX
         return f"  {body}  {evt_handle(event.seq)}"
 
     # --- rendering ---------------------------------------------------------------------------
@@ -144,24 +155,31 @@ def render_digest(
     budget: int,
     source_filter: str | None = None,
     warnings: Sequence[str] = (),
+    min_next_cursor: int | None = None,
 ) -> str:
     """Render the digest text (lines joined with ``\\n``, no trailing newline).
 
     ``events`` may hold any events; only those with ``seq > cursor`` (and ``source_id ==
     source_filter`` when given) are used. ``warnings`` are complete lines, already starting with
     ``warning: ``. A budget below ``MIN_BUDGET`` is raised to it and the header shows that value.
+    ``min_next_cursor`` (the retention floor, ``pruned_through_seq``) only matters when there are
+    no events and no source filter: if it is above ``cursor`` it becomes the next cursor (rule 8).
     """
     budget = max(budget, MIN_BUDGET)
     digest = _Digest(agent_id, cursor, events, sources, budget, source_filter, warnings)
     if not digest.ranked:
-        # Rule 8: no note, no footer.
-        if source_filter is None:
-            head = f"since · agent={agent_id} · no new events after cursor {cursor}"
-            head += f" · next_cursor={cursor}"
-        else:
+        # Rule 8: no note; a footer only when the retention floor is ahead of the cursor.
+        if source_filter is not None:
             head = (
                 f"since · agent={agent_id} · source={source_filter}"
                 f" · no new events after cursor {cursor}"
             )
-        return "\n".join([head, *warnings])
+            return "\n".join([head, *warnings])
+        next_cursor = cursor if min_next_cursor is None else max(cursor, min_next_cursor)
+        head = f"since · agent={agent_id} · no new events after cursor {cursor}"
+        head += f" · next_cursor={next_cursor}"
+        lines = [head, *warnings]
+        if next_cursor > cursor:
+            lines.append(f"after handling: ack(cursor={next_cursor})")
+        return "\n".join(lines)
     return digest.render(digest.choose_k())

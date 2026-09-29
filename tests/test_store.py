@@ -5,12 +5,14 @@ from __future__ import annotations
 import sqlite3
 import stat
 import sys
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import since.store as store_mod
 from since.model import (
     KIND_ADDED,
     KIND_BASELINE,
@@ -102,6 +104,59 @@ def test_newer_schema_version_is_refused(since_home_dir: Path) -> None:
         s.set_meta("schema_version", "99")
     with pytest.raises(StoreError, match="schema version 99"):
         Store.open()
+
+
+def test_open_of_an_existing_database_does_not_take_the_write_lock(
+    since_home_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with Store.open() as s:  # creates the schema
+        s.set_cursor("agent", 7, at())
+    monkeypatch.setattr(store_mod, "BUSY_TIMEOUT_MS", 200)
+    holder = sqlite3.connect(since_home_dir / "since.db", isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")  # e.g. the daemon in the middle of a collection
+
+        started = time.monotonic()
+        with Store.open() as reader:  # a read-only command (digest, status, mcp) must not wait
+            assert reader.get_cursor("agent") == 7
+            assert reader.get_meta("schema_version") == "1"
+        assert time.monotonic() - started < 1.0
+
+        # control: with the schema check forced onto the write path the open does block
+        monkeypatch.setattr(Store, "_schema_is_current", lambda self: False)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Store.open()
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+
+def test_open_of_an_empty_database_file_creates_the_schema(since_home_dir: Path) -> None:
+    since_home_dir.mkdir()
+    sqlite3.connect(since_home_dir / "since.db").close()  # a file without any table
+
+    with Store.open() as s:
+        assert s.get_meta("schema_version") == "1"
+        assert s.get_cursor("agent") == 0
+        assert s.events_after(0) == []
+
+
+def test_open_completes_a_database_that_has_meta_but_no_schema_version(
+    since_home_dir: Path,
+) -> None:
+    since_home_dir.mkdir()
+    con = sqlite3.connect(since_home_dir / "since.db")
+    try:
+        with con:
+            con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            con.execute("INSERT INTO meta VALUES ('daemon_pid', '5')")
+    finally:
+        con.close()
+
+    with Store.open() as s:
+        assert s.get_meta("schema_version") == "1"
+        assert s.get_meta("daemon_pid") == "5"  # existing meta is kept
+        assert s.list_source_states() == []  # the rest of the schema now exists
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")

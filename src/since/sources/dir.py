@@ -24,9 +24,15 @@ touching a file never creates an event.
 
 Symlinked files are read like any other file; symlinked directories are not followed. Files that are
 not regular files (FIFOs, sockets, devices) are ignored, as are files whose relative path cannot be
-encoded as UTF-8 (they could never be stored). A directory or file that cannot be read fails the
-whole run with a ``CollectError`` naming its relative path (D5): skipping it would look like a
-removal. Nothing here ever puts file content in an error message.
+encoded as UTF-8 (they could never be stored).
+
+Unreadable things (D5): a directory that cannot be listed, or a missing/non-directory root, fails
+the whole run with a ``CollectError`` (its contents are unknown; skipping it would look like a
+removal). A *file* that exists but cannot be opened or read (permission denied, sharing violation
+because another program holds it open, ...) is reported in ``CollectOutput.unavailable``: the runner
+keeps its last known record, so it neither produces an event nor blocks the other files. A file that
+vanishes between listing and reading (``FileNotFoundError``, also a dangling symlink) is simply not
+included: it really is gone. Nothing here ever puts file content in an error message.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ from pathlib import Path
 
 from since.config import ConfigError, SourceConfig
 from since.model import Record, Scalar
-from since.sources import CollectError
+from since.sources import CollectError, CollectOutput
 
 DEFAULT_INCLUDE = ("**/*",)
 DEFAULT_MAX_TEXT_BYTES = 65536
@@ -245,11 +251,14 @@ class DirCollector:
     def key_label(self, cfg: SourceConfig) -> str:
         return ""
 
-    def collect(self, cfg: SourceConfig) -> list[Record]:
+    def collect(self, cfg: SourceConfig) -> CollectOutput:
         opts = _parse_options(cfg)
         root = opts.root
         if not root.is_dir():
-            raise CollectError(f'root "{opts.path}" does not exist or is not a directory')
+            # Lead with the cause: digests cap messages at 120 chars and the path can be long.
+            if root.exists():
+                raise CollectError(f'root is not a directory: "{opts.path}"')
+            raise CollectError(f'root directory not found: "{opts.path}"')
 
         def walk_error(exc: OSError) -> None:
             # os.walk would silently skip an unreadable directory; its files would then look
@@ -262,6 +271,7 @@ class DirCollector:
             raise CollectError(f"cannot list {where}: {_reason(exc)}") from exc
 
         records: list[Record] = []
+        unavailable: list[str] = []
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=walk_error):
             rel_dir = Path(dirpath).relative_to(root).as_posix()
             prefix = "" if rel_dir == "." else rel_dir + "/"
@@ -284,8 +294,13 @@ class DirCollector:
                     if not stat.S_ISREG(os.stat(full).st_mode):  # follows symlinks
                         continue
                     fields = _read_fields(full, opts.max_text_bytes)
-                except OSError as exc:
-                    raise CollectError(f'cannot read "{rel}": {_reason(exc)}') from exc
+                except FileNotFoundError:
+                    continue  # vanished after the listing (or a dangling symlink): really gone
+                except OSError:
+                    # Present but unreadable right now (locked, no permission, ...): keep its
+                    # last known record instead of failing the run or reporting a removal.
+                    unavailable.append(rel)
+                    continue
                 records.append(Record.make(rel, fields))
         records.sort(key=lambda r: r.key)
-        return records
+        return CollectOutput(records, sorted(unavailable))

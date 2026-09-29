@@ -9,6 +9,7 @@ actually used.
 from __future__ import annotations
 
 import importlib
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from since.config import SourceConfig
@@ -19,6 +20,19 @@ class CollectError(Exception):
     """A collection failed for a reason worth showing to the human/agent.
 
     ``str(exc)`` is stored as the ``source_error`` message, so it must not contain secrets."""
+
+
+@dataclass(frozen=True)
+class CollectOutput:
+    """A collection result that also reports keys it could not read this run (D5).
+
+    ``unavailable`` lists keys that *exist* but could not be read right now (e.g. a file another
+    program holds open). The runner keeps their last known record: no event, never ``removed``.
+    A key that was never seen before is simply left out until it becomes readable. A key must not
+    appear both in ``records`` and in ``unavailable``."""
+
+    records: list[Record]
+    unavailable: list[str] = field(default_factory=list)
 
 
 class Collector(Protocol):
@@ -36,9 +50,10 @@ class Collector(Protocol):
         ``""`` when the quoted key alone is clear enough."""
         ...
 
-    def collect(self, cfg: SourceConfig) -> list[Record]:
-        """Read the source now. Raise ``CollectError`` (or anything else) on failure; a failed
-        collection must never be reported as an empty list."""
+    def collect(self, cfg: SourceConfig) -> list[Record] | CollectOutput:
+        """Read the source now. Return the records, or a :class:`CollectOutput` when some keys
+        exist but could not be read (``unavailable``). Raise ``CollectError`` (or anything else)
+        on failure; a failed collection must never be reported as an empty list."""
         ...
 
 

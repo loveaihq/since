@@ -1,0 +1,4 @@
+since · agent=sleeper · no new events after cursor 5 · next_cursor=12
+warning: daemon heartbeat stale (47m ago; shortest schedule 15m); data may be stale
+warning: events 6-12 expired (retention) before this agent read them
+after handling: ack(cursor=12)

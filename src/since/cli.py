@@ -114,6 +114,9 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         result = run_collection(store, found[0], found[1], _now())
     finally:
         store.close()
+    if result.superseded:
+        print(f"{source_id}: superseded by a newer collection; nothing stored")
+        return 0
     if result.error is not None:
         print(f"{source_id}: collection failed: {q(result.error, GET_CAP)}")
         return 1

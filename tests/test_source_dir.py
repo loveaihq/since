@@ -26,9 +26,10 @@ from since.model import (
     KIND_SOURCE_RECOVERED,
     Record,
 )
-from since.sources import CollectError, get_collector
+from since.sources import CollectError, CollectOutput, get_collector
 from since.sources.dir import DirCollector, compile_glob, glob_match
 from since.store import Store
+from since.timeutil import to_iso
 
 T0 = datetime(2026, 9, 29, 9, 0, 0, tzinfo=UTC)
 
@@ -48,8 +49,13 @@ def make_cfg(root: Path | str, source_id: str = "docs", **options: Any) -> Sourc
     return SourceConfig(id=source_id, type="dir", options={"path": str(root), **options})
 
 
-def collect(root: Path, **options: Any) -> list[Record]:
+def collect_output(root: Path, **options: Any) -> CollectOutput:
     return DirCollector().collect(make_cfg(root, **options))
+
+
+def collect(root: Path, **options: Any) -> list[Record]:
+    """The records of one collection (``unavailable`` is checked by the tests that need it)."""
+    return collect_output(root, **options).records
 
 
 def keys(records: list[Record]) -> list[str]:
@@ -389,9 +395,10 @@ def test_tilde_in_path_is_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
 
-    records = DirCollector().collect(opts_cfg(path="~/docs"))
+    output = DirCollector().collect(opts_cfg(path="~/docs"))
 
-    assert keys(records) == ["a.txt"]
+    assert keys(output.records) == ["a.txt"]
+    assert output.unavailable == []
 
 
 # -- include / exclude ---------------------------------------------------------------------------
@@ -581,7 +588,7 @@ def test_unlistable_directory_fails_the_run_naming_it(
     write(root, "vendor/v.txt", "v")
     add_unlistable_dir(monkeypatch, root, "vendor", "ghost")  # stands in for "permission denied"
 
-    with pytest.raises(CollectError, match=r'cannot list directory "vendor/ghost"'):
+    with pytest.raises(CollectError, match=r'^cannot list directory "vendor/ghost": '):
         collect(root)
 
     # ...and a pattern that does not cover the whole directory does not hide it
@@ -701,7 +708,7 @@ def test_missing_root_is_a_source_error_and_never_removes(store: Store, root: Pa
 
     failed = run(store, cfg, 1)
 
-    assert failed.error is not None and str(root) in failed.error
+    assert failed.error == f'root directory not found: "{root}"'
     assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
     assert sorted(store.get_snapshot("docs")) == ["a.txt", "b.txt"]
     assert run(store, cfg, 2).error is not None  # second failure: still one source_error
@@ -729,54 +736,282 @@ def test_root_that_is_a_file_is_a_source_error(store: Store, tmp_path: Path) -> 
 
     result = run(store, make_cfg(afile))
 
-    assert result.error is not None and "not a directory" in result.error
+    assert result.error == f'root is not a directory: "{afile}"'
     assert kinds(store) == [(KIND_SOURCE_ERROR, None)]
 
 
-def test_unreadable_file_fails_the_run_and_names_only_its_path(
-    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    write(root, "a.txt", "fine")
-    write(root, "sub/locked.txt", "TOP-SECRET-CONTENT")
-    cfg = make_cfg(root)
-    run(store, cfg)
+def test_root_errors_lead_with_the_cause_even_for_a_long_path(tmp_path: Path) -> None:
+    # Digests cut messages at 120 characters: a long absolute path must not hide the cause.
+    deep = tmp_path.joinpath(*["a-rather-long-directory-name"] * 6)
+    assert len(str(deep)) > 120
+    with pytest.raises(CollectError) as info:
+        DirCollector().collect(make_cfg(deep))
+    assert str(info.value).startswith('root directory not found: "')
+    assert str(info.value)[:120].count("root directory not found") == 1
 
+    afile = write(tmp_path, "plain.txt", "x")
+    with pytest.raises(CollectError) as info:
+        DirCollector().collect(make_cfg(afile))
+    assert str(info.value).startswith('root is not a directory: "')
+
+
+# -- unreadable files (D5) -----------------------------------------------------------------------
+
+
+def lock_files(
+    monkeypatch: pytest.MonkeyPatch,
+    *rel_paths: str,
+    error: type[OSError] = PermissionError,
+) -> set[str]:
+    """Make reading the files at these relative paths raise ``error`` (like a file another program
+    holds open). Returns the live set: remove a path from it to make that file readable again."""
+    locked = set(rel_paths)
     real = dirmod._read_fields
 
     def deny(path: str, max_text_bytes: int) -> dict[str, Any]:
-        if path.endswith("locked.txt"):
-            raise PermissionError(13, "Permission denied", path)
+        if any(path.replace("\\", "/").endswith("/" + rel) for rel in locked):
+            raise error(13, "Permission denied", path)
         return real(path, max_text_bytes)
 
     monkeypatch.setattr(dirmod, "_read_fields", deny)
+    return locked
 
+
+def test_unreadable_file_is_reported_as_unavailable_and_the_rest_is_still_read(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(root, "a.txt", "fine")
+    write(root, "sub/locked.txt", "TOP-SECRET-CONTENT")
+    write(root, "z.txt", "also fine")
+    lock_files(monkeypatch, "sub/locked.txt")
+
+    output = collect_output(root)
+
+    assert isinstance(output, CollectOutput)
+    assert keys(output.records) == ["a.txt", "z.txt"]
+    assert output.unavailable == ["sub/locked.txt"]
+
+
+def test_unavailable_keys_are_sorted(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for rel in ("b.txt", "a.txt", "c/d.txt"):
+        write(root, rel, rel)
+    lock_files(monkeypatch, "b.txt", "a.txt", "c/d.txt")
+
+    assert collect_output(root).unavailable == ["a.txt", "b.txt", "c/d.txt"]
+
+
+@pytest.mark.parametrize("error", [PermissionError, OSError, IsADirectoryError])
+def test_seen_file_that_becomes_unreadable_keeps_its_record_then_reports_the_change(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+) -> None:
+    write(root, "a.txt", "fine")
+    write(root, "sub/locked.txt", "before")
+    cfg = make_cfg(root)
+    run(store, cfg, 0)
+
+    locked = lock_files(monkeypatch, "sub/locked.txt", error=error)
     result = run(store, cfg, 1)
 
-    assert result.error is not None
-    assert 'cannot read "sub/locked.txt"' in result.error
-    assert "Permission denied" in result.error
-    assert "TOP-SECRET-CONTENT" not in result.error
-    assert str(tmp_path) not in result.error  # relative path only
-    # whole run failed: no partial diff, no removed events, snapshot intact
-    assert kinds(store) == [(KIND_BASELINE, None), (KIND_SOURCE_ERROR, None)]
+    # not an error, no event, not removed, and still counted
+    assert result == CollectResult(seqs=[], error=None)
+    assert kinds(store) == [(KIND_BASELINE, None)]
     assert sorted(store.get_snapshot("docs")) == ["a.txt", "sub/locked.txt"]
+    assert store.get_snapshot("docs")["sub/locked.txt"].fields == {"size": 6, "text": "before"}
+    got = store.get_record("docs", "sub/locked.txt")
+    assert got is not None and got[1] is True and got[2] == to_iso(at(0))  # row untouched
+    state = store.get_source_state("docs")
+    assert state is not None and state.record_count == 2 and state.in_error is False
+    assert state.last_success_at == to_iso(at(1))
+
+    # still locked next time: still nothing
+    assert run(store, cfg, 2).seqs == []
+
+    # readable again, with different content: a normal `modified`
+    write(root, "sub/locked.txt", "after!")
+    locked.clear()
+    result = run(store, cfg, 3)
+
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_MODIFIED, "sub/locked.txt")]
+    assert len(result.seqs) == 1
+    (event,) = store.events_after(0, "docs")[1:]
+    assert [(c.field, c.old, c.new) for c in event.field_changes] == [("text", "before", "after!")]
+    assert store.get_snapshot("docs")["sub/locked.txt"].fields == {"size": 6, "text": "after!"}
 
 
-def test_unreadable_file_on_first_run_leaves_no_baseline(
+def test_seen_file_that_becomes_readable_unchanged_creates_no_event(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(root, "a.txt", "same")
+    cfg = make_cfg(root)
+    run(store, cfg, 0)
+    locked = lock_files(monkeypatch, "a.txt")
+    run(store, cfg, 1)
+
+    locked.clear()
+
+    assert run(store, cfg, 2).seqs == []
+    assert kinds(store) == [(KIND_BASELINE, None)]
+
+
+def test_never_seen_unreadable_file_is_absent_until_it_becomes_readable(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(root, "a.txt", "fine")
+    write(root, "b.txt", "locked from the start")
+    cfg = make_cfg(root)
+    locked = lock_files(monkeypatch, "b.txt")
+
+    run(store, cfg, 0)  # baseline: the unreadable file is left out and not counted
+
+    (baseline,) = store.events_after(0, "docs")
+    assert (baseline.kind, baseline.detail) == (KIND_BASELINE, {"record_count": 1})
+    assert sorted(store.get_snapshot("docs")) == ["a.txt"]
+    assert store.get_record("docs", "b.txt") is None
+
+    result = run(store, cfg, 1)  # still unreadable: not stored, not counted, no event
+
+    assert result == CollectResult(seqs=[], error=None)
+    assert store.get_record("docs", "b.txt") is None
+    state = store.get_source_state("docs")
+    assert state is not None and state.record_count == 1
+
+    locked.clear()  # readable now: it appears as `added`
+    run(store, cfg, 2)
+
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_ADDED, "b.txt")]
+    state = store.get_source_state("docs")
+    assert state is not None and state.record_count == 2
+
+
+def test_unreadable_files_on_first_run_leave_a_baseline_without_them(
     store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write(root, "a.txt", "fine")
     write(root, "b.txt", "x")
-
-    def deny(path: str, max_text_bytes: int) -> dict[str, Any]:
-        raise OSError("boom")
-
-    monkeypatch.setattr(dirmod, "_read_fields", deny)
+    lock_files(monkeypatch, "a.txt", "b.txt", error=OSError)
 
     result = run(store, make_cfg(root))
 
-    assert result.error is not None and 'cannot read "a.txt"' in result.error
-    assert kinds(store) == [(KIND_SOURCE_ERROR, None)]
+    assert result.error is None
+    (event,) = store.events_after(0, "docs")
+    assert (event.kind, event.detail) == (KIND_BASELINE, {"record_count": 0})
+    assert store.get_snapshot("docs") == {}
+    state = store.get_source_state("docs")
+    assert state is not None and state.baselined is True and state.record_count == 0
+
+
+def test_unreadable_file_does_not_stop_other_changes_from_being_reported(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("a.txt", "b.txt", "locked.txt"):
+        write(root, name, f"{name} v1")
+    cfg = make_cfg(root)
+    run(store, cfg, 0)
+    lock_files(monkeypatch, "locked.txt", "newlocked.txt")
+    write(root, "a.txt", "a.txt v2")  # modified
+    write(root, "c.txt", "c.txt new")  # added
+    (root / "b.txt").unlink()  # removed
+    write(root, "locked.txt", "locked.txt v2")  # changed, but cannot be read
+    write(root, "newlocked.txt", "never seen")  # new, but cannot be read
+
+    result = run(store, cfg, 1)
+
+    assert result.error is None
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_MODIFIED, "a.txt"),
+        (KIND_REMOVED, "b.txt"),
+        (KIND_ADDED, "c.txt"),
+    ]
+    assert sorted(store.get_snapshot("docs")) == ["a.txt", "c.txt", "locked.txt"]
+    assert store.get_snapshot("docs")["locked.txt"].fields["text"] == "locked.txt v1"
+    state = store.get_source_state("docs")
+    assert state is not None and state.record_count == 3  # a, c and the carried locked.txt
+
+
+def test_unreadable_file_that_is_deleted_meanwhile_is_removed_normally(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(root, "a.txt", "fine")
+    write(root, "locked.txt", "x")
+    cfg = make_cfg(root)
+    run(store, cfg, 0)
+    lock_files(monkeypatch, "locked.txt")
+    run(store, cfg, 1)
+    assert kinds(store) == [(KIND_BASELINE, None)]
+
+    (root / "locked.txt").unlink()  # no longer listed: it really is gone
+    run(store, cfg, 2)
+
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_REMOVED, "locked.txt")]
+    state = store.get_source_state("docs")
+    assert state is not None and state.record_count == 1
+
+
+def test_carried_forward_file_survives_a_failed_run_in_between(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(root, "a.txt", "fine")
+    write(root, "locked.txt", "x")
+    cfg = make_cfg(root)
+    run(store, cfg, 0)
+    lock_files(monkeypatch, "locked.txt")
+    shutil.rmtree(root)
+    assert run(store, cfg, 1).error is not None  # root gone: a real failure
+    write(root, "a.txt", "fine")
+    write(root, "locked.txt", "x")
+
+    run(store, cfg, 2)  # recovered, locked.txt unreadable
+
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_SOURCE_ERROR, None),
+        (KIND_SOURCE_RECOVERED, None),
+    ]
+    assert sorted(store.get_snapshot("docs")) == ["a.txt", "locked.txt"]
+
+
+def test_file_that_vanishes_between_listing_and_reading_is_simply_gone(
+    store: Store, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(root, "a.txt", "fine")
+    write(root, "gone.txt", "x")
+    cfg = make_cfg(root)
+    run(store, cfg, 0)
+    lock_files(monkeypatch, "gone.txt", error=FileNotFoundError)
+
+    output = collect_output(root)
+    assert keys(output.records) == ["a.txt"]
+    assert output.unavailable == []  # not "unavailable": it does not exist any more
+
+    run(store, cfg, 1)
+
+    assert kinds(store) == [(KIND_BASELINE, None), (KIND_REMOVED, "gone.txt")]
+
+
+@pytest.mark.parametrize(
+    ("error", "listed_as"),
+    [(FileNotFoundError, "gone"), (PermissionError, "unavailable")],
+)
+def test_stat_failures_are_classified_like_read_failures(
+    root: Path, monkeypatch: pytest.MonkeyPatch, error: type[OSError], listed_as: str
+) -> None:
+    # e.g. a dangling symlink (FileNotFoundError) or a file that cannot even be examined
+    write(root, "a.txt", "fine")
+    write(root, "odd.txt", "x")
+    real_stat = os.stat
+
+    def stat_with_failure(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(path).endswith("odd.txt"):
+            raise error(13, "denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_with_failure)
+
+    output = collect_output(root)
+
+    assert keys(output.records) == ["a.txt"]
+    assert output.unavailable == ([] if listed_as == "gone" else ["odd.txt"])
 
 
 posix_non_root = pytest.mark.skipif(
@@ -786,18 +1021,58 @@ posix_non_root = pytest.mark.skipif(
 
 
 @posix_non_root
-def test_permission_denied_file_fails_the_run(store: Store, root: Path) -> None:
+def test_permission_denied_file_keeps_its_last_record(store: Store, root: Path) -> None:
     write(root, "a.txt", "fine")
     locked = write(root, "locked.txt", "TOP-SECRET-CONTENT")
+    cfg = make_cfg(root)
+    run(store, cfg)
+    locked.chmod(0)
+    try:
+        result = run(store, cfg, 1)
+    finally:
+        locked.chmod(0o600)
+
+    assert result == CollectResult(seqs=[], error=None)
+    assert kinds(store) == [(KIND_BASELINE, None)]
+    assert sorted(store.get_snapshot("docs")) == ["a.txt", "locked.txt"]
+
+
+@posix_non_root
+def test_permission_denied_file_on_first_run_is_left_out(store: Store, root: Path) -> None:
+    write(root, "a.txt", "fine")
+    locked = write(root, "locked.txt", "x")
     locked.chmod(0)
     try:
         result = run(store, make_cfg(root))
     finally:
         locked.chmod(0o600)
 
-    assert result.error is not None and 'cannot read "locked.txt"' in result.error
-    assert "TOP-SECRET-CONTENT" not in result.error
-    assert kinds(store) == [(KIND_SOURCE_ERROR, None)]
+    assert result.error is None
+    assert sorted(store.get_snapshot("docs")) == ["a.txt"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="byte-range locks are the Windows way")
+def test_windows_locked_file_keeps_its_last_record(store: Store, root: Path) -> None:
+    import msvcrt
+
+    write(root, "a.txt", "fine")
+    held = write(root, "held.txt", "content")
+    cfg = make_cfg(root)
+    run(store, cfg)
+
+    with open(held, "r+b") as fh:
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 4)  # other handles can no longer read it
+        try:
+            assert collect_output(root).unavailable == ["held.txt"]
+            result = run(store, cfg, 1)
+        finally:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 4)
+
+    assert result == CollectResult(seqs=[], error=None)
+    assert kinds(store) == [(KIND_BASELINE, None)]
+    assert sorted(store.get_snapshot("docs")) == ["a.txt", "held.txt"]
+    assert run(store, cfg, 2).seqs == []  # released again, unchanged
 
 
 @posix_non_root
@@ -866,14 +1141,25 @@ def test_symlinked_directories_are_not_followed(root: Path, tmp_path: Path) -> N
     assert keys(collect(root)) == ["real/x.txt"]
 
 
-def test_dangling_symlink_fails_the_run_naming_it(store: Store, root: Path) -> None:
+def test_dangling_symlink_counts_as_a_file_that_is_gone(store: Store, root: Path) -> None:
+    target = write(root, "target.txt", "x")
     write(root, "a.txt", "fine")
+    symlink_or_skip(target, root / "link.txt")
+    cfg = make_cfg(root)
+    run(store, cfg)
+    assert sorted(store.get_snapshot("docs")) == ["a.txt", "link.txt", "target.txt"]
     symlink_or_skip(root / "missing-target", root / "dangling.txt")
 
-    result = run(store, make_cfg(root))
+    target.unlink()  # link.txt now dangles too
+    result = run(store, cfg, 1)
 
-    assert result.error is not None and 'cannot read "dangling.txt"' in result.error
-    assert kinds(store) == [(KIND_SOURCE_ERROR, None)]
+    assert result.error is None  # not a failure, and not "unavailable" either
+    assert collect_output(root).unavailable == []
+    assert kinds(store) == [
+        (KIND_BASELINE, None),
+        (KIND_REMOVED, "link.txt"),
+        (KIND_REMOVED, "target.txt"),
+    ]
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
@@ -914,5 +1200,5 @@ def test_real_undecodable_file_name_is_skipped(root: Path) -> None:
 
 
 def test_collect_error_type_for_root_problems(tmp_path: Path) -> None:
-    with pytest.raises(CollectError, match="does not exist or is not a directory"):
+    with pytest.raises(CollectError, match="root directory not found"):
         DirCollector().collect(make_cfg(tmp_path / "nope"))

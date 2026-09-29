@@ -9,7 +9,8 @@ Three kinds exist::
 Handles come from agents, so parsing is strict: exact scheme, canonical positive integers (no
 signs, no leading zeros, no non-ASCII digits, at most SQLite's INTEGER range), ``from <= to``,
 source ids matching ``SOURCE_ID_RE``, only the ``source`` and ``after`` query parameters and each
-at most once. Anything else raises :class:`HandleError`. Surrounding whitespace is not stripped.
+at most once. Anything else raises :class:`HandleError`. Surrounding whitespace is not stripped
+here (``Service.get`` strips it before parsing).
 """
 
 from __future__ import annotations

@@ -1,8 +1,9 @@
 """The daemon: the only long-running writer of events.
 
 ``Daemon.tick`` runs every source that is due (schedule elapsed since its last attempt), writes a
-heartbeat to the ``meta`` table and prunes expired data at most hourly. ``Daemon.run`` loops over
-``tick`` (or, with ``once=True``, runs every source once). The clock and the sleep function are
+heartbeat to the ``meta`` table (before each source run and at the end of the tick) and prunes
+expired data at most hourly. ``Daemon.run`` loops over ``tick`` (or, with ``once=True``, runs every
+source once and leaves its heartbeat behind, D16). The clock and the sleep function are
 injected so tests never wait. Nothing here calls an LLM.
 
 Meta keys owned by the daemon: ``daemon_pid``, ``daemon_heartbeat_at``, ``daemon_min_schedule_s``
@@ -159,7 +160,7 @@ class Daemon:
         except KeyboardInterrupt:
             pass
         finally:
-            self._clear_meta()
+            self._clear_meta(keep_heartbeat=once)
         return 0
 
     def _run_once(self) -> None:
@@ -172,12 +173,15 @@ class Daemon:
             self.tick(self._now_fn())
             self._sleep_fn(self._seconds_until_next_due(self._now_fn()))
 
-    def _clear_meta(self) -> None:
-        """Remove our heartbeat and pid. Left alone if another daemon owns the meta now (e.g.
-        it took over after this process was suspended) or if start() never claimed it."""
+    def _clear_meta(self, keep_heartbeat: bool = False) -> None:
+        """Remove our pid and, unless ``keep_heartbeat``, our heartbeat. Left alone if another
+        daemon owns the meta now (e.g. it took over after this process was suspended) or if
+        start() never claimed it. ``--once`` keeps its heartbeat (D16), so a scheduled run is
+        judged by the normal staleness rule instead of always being "not running"."""
         with self._store.transaction():
             if self._store.get_meta(META_PID) == str(self._pid):
-                self._store.set_meta(META_HEARTBEAT, None)
+                if not keep_heartbeat:
+                    self._store.set_meta(META_HEARTBEAT, None)
                 self._store.set_meta(META_PID, None)
 
     # -- one tick ----------------------------------------------------------------------------
@@ -208,6 +212,9 @@ class Daemon:
         for cfg, collector in items:
             ran.append(cfg.id)
             try:
+                # A long collection must not let the heartbeat go stale, or a second daemon could
+                # start; so beat with a fresh clock reading before every source, not just per tick.
+                self._store.set_meta(META_HEARTBEAT, to_iso(self._now_fn()))
                 result = run_collection(self._store, cfg, collector, now)
             except Exception as exc:  # store error etc.; the run was rolled back
                 self._retry_at[cfg.id] = now + timedelta(seconds=cfg.schedule_s)
@@ -215,6 +222,8 @@ class Daemon:
                 self._say(now, cfg.id, f"run failed: {detail}")
                 continue
             self._retry_at.pop(cfg.id, None)
+            if result.superseded:
+                continue  # a newer run stored its result first; nothing of ours was stored
             if result.error is not None:
                 self._say(now, cfg.id, f"collection failed: {result.error}")
             elif result.seqs:
@@ -222,7 +231,8 @@ class Daemon:
         return ran
 
     def _finish_tick(self, now: datetime) -> None:
-        self._store.set_meta(META_HEARTBEAT, to_iso(now))
+        # never older than the per-source beats written during this tick
+        self._store.set_meta(META_HEARTBEAT, to_iso(max(now, self._now_fn())))
         if self._prune_due(now):
             before = now - timedelta(days=self._config.retention_days)
             self._store.prune(before, now)

@@ -7,7 +7,7 @@ from __future__ import annotations
 import io
 import json
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -83,12 +83,35 @@ def test_collect_failure_exits_1_with_quoted_message(
     write_config(since_home_dir, [dir_source("broken", tmp_path / "does-not-exist")])
     code, out, err = run(capsys, "collect", "broken")
     assert code == 1
-    assert out.startswith('broken: collection failed: "root ')
-    assert "does not exist or is not a directory" in out
+    assert out.startswith('broken: collection failed: "root directory not found: ')
     assert out.endswith('"\n')
     assert err == ""
     with Store.open() as store:  # the failure is recorded as a source_error event
         assert [e.kind for e in store.events_after(0)] == ["source_error"]
+
+
+def collection_state(store: Store) -> tuple[Any, ...]:
+    """The collection-derived columns of the ``docs`` source (config columns get re-registered)."""
+    state = store.get_source_state("docs")
+    assert state is not None
+    return (state.last_success_at, state.last_error_at, state.in_error, state.record_count)
+
+
+def test_collect_superseded_by_a_newer_collection_exits_0_and_stores_nothing(
+    config: Path, watched: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = SourceConfig(id="docs", type="dir", options={"path": str(watched)})
+    with Store.open() as store:  # a newer collection (later than "now") already stored its result
+        run_collection(store, cfg, DirCollector(), datetime.now(UTC) + timedelta(hours=1))
+        before = (store.events_after(0), collection_state(store))
+    (watched / "b.txt").write_text("would be an added event\n", encoding="utf-8")
+
+    result = run(capsys, "collect", "docs")
+
+    assert result == (0, "docs: superseded by a newer collection; nothing stored\n", "")
+    with Store.open() as store:
+        assert (store.events_after(0), collection_state(store)) == before
+        assert sorted(store.get_snapshot("docs")) == ["notes.txt"]
 
 
 def test_collect_unknown_source_exits_2_without_creating_the_database(
@@ -288,8 +311,8 @@ def test_daemon_once_collects_every_source_and_exits_0(
     assert (code, out) == (0, "")
     with Store.open() as store:
         assert [e.kind for e in store.events_after(0)] == ["baseline"]
-        assert store.get_meta(META_HEARTBEAT) is None  # a clean exit removes the heartbeat
-        assert store.get_meta(META_PID) is None
+        assert store.get_meta(META_HEARTBEAT) is not None  # D16: --once leaves its heartbeat
+        assert store.get_meta(META_PID) is None  # ...but is no longer "the running daemon"
 
 
 def test_second_daemon_is_refused_with_exit_1(

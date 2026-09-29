@@ -67,6 +67,10 @@ def _invalid_agent(agent_id: object) -> str | None:
     return f"error: invalid agent_id {q(agent_id, DIGEST_CAP)}; use letters, digits, _ . -"
 
 
+def _unknown_source(source: object) -> str:
+    return f"error: unknown source {q(source, DIGEST_CAP)}"
+
+
 def _fmt_time(iso: str | None) -> str:
     """A stored ISO timestamp as shown to agents (``2026-09-29T09:12Z``)."""
     if not iso:
@@ -254,12 +258,21 @@ class Service:
     def _digest(self, agent_id: str, budget: int, source: str | None, now: datetime) -> str:
         store = self._store
         if source is not None and store.get_source_state(source) is None:
-            return f"error: unknown source {q(source, DIGEST_CAP)}"
+            return _unknown_source(source)
         cursor = store.get_cursor(agent_id)
         events = store.events_after(cursor, source)
         sources = {s.source_id: s for s in store.list_source_states()}
         return render_digest(
-            agent_id, cursor, events, sources, budget, source, self._warnings(cursor, now)
+            agent_id,
+            cursor,
+            events,
+            sources,
+            budget,
+            source,
+            self._warnings(cursor, now),
+            # With no events left after the cursor, a retention gap still moves the cursor
+            # forward (to pruned_through_seq) so the agent can ack past the expired range.
+            min_next_cursor=_int_meta(store.get_meta(META_PRUNED_THROUGH)),
         )
 
     # -- get -----------------------------------------------------------------------------------
@@ -271,12 +284,17 @@ class Service:
         agent_id: str = DEFAULT_AGENT,
         via: str = "mcp",
     ) -> str:
-        """Drill into an event, record or batch handle. Every response is logged."""
+        """Drill into an event, record or batch handle. Every response is logged.
+
+        Surrounding whitespace on the handle is ignored (agents paste handles with spaces or
+        newlines); the served log keeps the handle exactly as received.
+        """
         invalid = _invalid_agent(agent_id)
         if invalid is not None:
             return invalid
         now = self._now_fn()
-        text = self._get_text(handle, max(budget_tokens, MIN_BUDGET))
+        stripped = handle.strip() if isinstance(handle, str) else handle
+        text = self._get_text(stripped, max(budget_tokens, MIN_BUDGET))
         args = {"handle": handle, "budget_tokens": budget_tokens, "agent_id": agent_id}
         self._store.log_served(agent_id, "get", args, text, via, now)
         return text
@@ -320,6 +338,8 @@ class Service:
         return _fit_lines([header, NOTE_LINE], body, budget, _more_fields)
 
     def _get_batch(self, handle: BatchHandle, budget: int) -> str:
+        if handle.source is not None and self._store.get_source_state(handle.source) is None:
+            return _unknown_source(handle.source)
         base = batch_handle(handle.lo, handle.hi, source=handle.source)  # without ``after``
         in_range = self._store.events_in_range(handle.lo, handle.hi, source_id=handle.source)
         total = len(in_range)
@@ -401,7 +421,7 @@ class Service:
             )
         else:
             daemon = f"daemon heartbeat {fmt_age(beat.age_s)} ago"
-        lines = [f"since status · {daemon}"]
+        lines = [f"since status · {daemon}", NOTE_LINE]
         states = sorted(
             self._store.list_source_states(),
             key=lambda s: (_priority_rank(s.priority), s.source_id),

@@ -73,6 +73,8 @@ Event line bodies (`sym text`), L = record label:
   `! schema_changed: 2 extractor selectors match 0 rows ("a", "b")`
 
 Digest line = two spaces + body + two spaces + `since://evt/<seq>`.
+In `since` digests only, a `source_error` whose source has a later `source_recovered` among the events after
+the cursor gets ` (recovered)` appended to its body (ranking unchanged).
 
 Example (cursor 40; importance in brackets is NOT printed):
 ```

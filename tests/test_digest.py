@@ -357,6 +357,38 @@ def sources_h() -> dict[str, SourceState]:
     )
 
 
+def events_i() -> list[Event]:
+    """Errors and recoveries: only an error followed by a later recovery of its source is marked."""
+    return [
+        # docs: recovered (400) BEFORE its error (402) -> the error is still current
+        ev(
+            400,
+            "docs",
+            KIND_SOURCE_RECOVERED,
+            detail={"error_since": T0, "last_error": "x"},
+            importance=3,
+        ),
+        ev(
+            401,
+            "po-table",
+            KIND_SOURCE_ERROR,
+            detail={"error": "connection refused"},
+            importance=15,
+        ),
+        ev(402, "docs", KIND_SOURCE_ERROR, detail={"error": "disk not ready"}, importance=10),
+        ev(
+            403,
+            "po-table",
+            KIND_SOURCE_RECOVERED,
+            detail={"error_since": T0, "last_error": "x"},
+            importance=3,
+        ),
+        ev(404, "po-table", KIND_MODIFIED, "4500123", [fc("status", "Open", "Cancelled")], 22),
+        # po-table failed again after the recovery -> not marked
+        ev(405, "po-table", KIND_SOURCE_ERROR, detail={"error": "timeout"}, importance=15),
+    ]
+
+
 GOLDEN_CASES = {
     "a_example": lambda: render_digest("default", 40, events_a(), sources_a(), 800),
     "b_omitted": lambda: render_digest("default", 1000, events_b(), sources_b(), 400),
@@ -382,6 +414,19 @@ GOLDEN_CASES = {
         "default", 100, events_g(), states(src("crm", "normal", "id", "sql")), 2000
     ),
     "h_kinds": lambda: render_digest("default", 200, events_h(), sources_h(), 2000),
+    "i_recovered": lambda: render_digest("default", 399, events_i(), sources_a(), 800),
+    "j_retention_gap": lambda: render_digest(
+        "sleeper",
+        5,
+        [ev(5, "docs", KIND_ADDED, "old.txt", importance=6)],
+        sources_a(),
+        800,
+        warnings=[
+            "warning: daemon heartbeat stale (47m ago; shortest schedule 15m); data may be stale",
+            "warning: events 6-12 expired (retention) before this agent read them",
+        ],
+        min_next_cursor=12,
+    ),
 }
 
 
@@ -437,6 +482,52 @@ def test_empty_when_filter_matches_nothing() -> None:
 def test_empty_digest_has_no_note_or_footer() -> None:
     out = render_digest("a1", 0, [], {}, 800, warnings=["warning: x"])
     assert NOTE_LINE not in out and "after handling" not in out
+
+
+def test_min_next_cursor_moves_an_empty_digest_past_the_retention_gap() -> None:
+    out = render_digest("a1", 5, [], {}, 800, warnings=["warning: w"], min_next_cursor=12)
+    assert out == "\n".join(
+        [
+            "since \u00b7 agent=a1 \u00b7 no new events after cursor 5 \u00b7 next_cursor=12",
+            "warning: w",
+            "after handling: ack(cursor=12)",
+        ]
+    )
+    assert NOTE_LINE not in out
+    # without warnings: header and footer only
+    assert render_digest("a1", 5, [], {}, 800, min_next_cursor=12).split("\n") == [
+        "since \u00b7 agent=a1 \u00b7 no new events after cursor 5 \u00b7 next_cursor=12",
+        "after handling: ack(cursor=12)",
+    ]
+
+
+@pytest.mark.parametrize("floor", [None, 0, 3, 5])
+def test_min_next_cursor_at_or_below_the_cursor_changes_nothing(floor: int | None) -> None:
+    plain = render_digest("a1", 5, [], {}, 800, warnings=["warning: w"])
+    assert render_digest("a1", 5, [], {}, 800, warnings=["warning: w"], min_next_cursor=floor) == (
+        plain
+    )
+    assert plain == "\n".join(
+        [
+            "since \u00b7 agent=a1 \u00b7 no new events after cursor 5 \u00b7 next_cursor=5",
+            "warning: w",
+        ]
+    )
+
+
+def test_min_next_cursor_is_ignored_with_a_source_filter() -> None:
+    out = render_digest("a1", 5, [], {}, 800, source_filter="docs", min_next_cursor=12)
+    assert out == "since \u00b7 agent=a1 \u00b7 source=docs \u00b7 no new events after cursor 5"
+
+
+def test_min_next_cursor_is_ignored_when_there_are_events() -> None:
+    events = [ev(20, "docs", KIND_ADDED, "x", importance=6)]
+    with_floor = render_digest(
+        "a1", 5, events, states(src("docs", "normal")), 800, min_next_cursor=12
+    )
+    assert with_floor == render_digest("a1", 5, events, states(src("docs", "normal")), 800)
+    assert with_floor.split("\n")[0].endswith("next_cursor=20")
+    assert with_floor.split("\n")[-1] == "after handling: ack(cursor=20)"
 
 
 def test_budget_below_minimum_is_clamped_in_header() -> None:
@@ -570,6 +661,70 @@ def test_omitted_lines_ordered_by_max_omitted_importance() -> None:
     out = d.render(8).split("\n")  # only alpha's events shown
     omitted = [line.split()[1] for line in out if line.startswith("omitted: ")]
     assert omitted == ["delta", "gamma", "beta"]  # 8, 8 (id asc), 7
+
+
+# --- resolved errors -----------------------------------------------------------------------------
+
+
+def error_lines(out: str) -> dict[int, str]:
+    """evt seq -> full line, for the source_error lines of a digest."""
+    return {
+        int(line.rsplit("/", 1)[1]): line for line in out.split("\n") if "! source_error" in line
+    }
+
+
+def test_resolved_source_error_is_marked_and_later_errors_are_not() -> None:
+    lines = error_lines(GOLDEN_CASES["i_recovered"]())
+    assert lines == {
+        401: '  ! source_error: "connection refused" (recovered)  since://evt/401',
+        402: '  ! source_error: "disk not ready"  since://evt/402',  # recovered BEFORE it (400)
+        405: '  ! source_error: "timeout"  since://evt/405',  # failed again after the recovery
+    }
+
+
+def test_recovered_marker_needs_the_same_source() -> None:
+    events = [
+        ev(1, "docs", KIND_SOURCE_ERROR, detail={"error": "boom"}, importance=15),
+        ev(2, "po-table", KIND_SOURCE_RECOVERED, importance=3),
+    ]
+    out = render_digest("a", 0, events, sources_a(), 800)
+    assert "(recovered)" not in out
+
+
+def test_recovered_marker_counts_recoveries_that_are_not_shown() -> None:
+    d = _Digest("default", 399, events_i(), sources_a(), 800, None, ())
+    # ranking: 404 (22), 401 (15), 405 (15), 402 (10), 400 (3), 403 (3); show the top 3 only
+    out = d.render(3)
+    assert '! source_error: "connection refused" (recovered)  since://evt/401' in out
+    assert "since://evt/403" not in out  # the recovery itself is omitted
+    assert "omitted: docs 2 " in out
+
+
+def test_recovered_marker_ranking_and_counts_are_unchanged() -> None:
+    marked = render_digest("default", 399, events_i(), sources_a(), 800)
+    ids = [int(line.rsplit("/", 1)[1]) for line in marked.split("\n") if line.startswith("  ")]
+    assert ids == [404, 401, 405, 403, 402, 400]  # importance desc / seq asc within each group
+    assert marked.split("\n")[0].startswith("since \u00b7 agent=default \u00b7 events 400-405 (6) ")
+    # events at or below the cursor never resolve anything
+    out = render_digest("default", 403, events_i(), sources_a(), 800)
+    assert "(recovered)" not in out
+    assert '  ! source_error: "timeout"  since://evt/405' in out.split("\n")
+
+
+def test_recovered_marker_with_a_source_filter() -> None:
+    out = render_digest("default", 399, events_i(), sources_a(), 800, source_filter="po-table")
+    assert error_lines(out) == {
+        401: '  ! source_error: "connection refused" (recovered)  since://evt/401',
+        405: '  ! source_error: "timeout"  since://evt/405',
+    }
+
+
+def test_recovered_marker_is_only_in_digest_lines_not_in_batch_bodies() -> None:
+    e = ev(1, "docs", KIND_SOURCE_ERROR, detail={"error": "boom"}, importance=15)
+    assert body(e) == '! source_error: "boom"'
+    later = ev(2, "docs", KIND_SOURCE_RECOVERED, importance=3)
+    assert "(recovered)" in render_digest("a", 0, [e, later], {}, 800)
+    assert "(recovered)" not in body(e)
 
 
 # --- hostile values ------------------------------------------------------------------------------

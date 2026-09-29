@@ -128,7 +128,7 @@ def test_end_to_end(tmp_path: Path, since_home_dir: Path) -> None:
             ],
         )
         con.commit()
-    (docs / "notes.txt").write_text("todo one\n", encoding="utf-8")
+    (docs / "notes.txt").write_text("todo one\n", encoding="utf-8", newline="\n")
     (docs / "old.txt").write_text("remove me\n", encoding="utf-8")
     (docs / "drafts" / "wip.txt").write_text("work in progress\n", encoding="utf-8")
     write_config(home, docs)
@@ -154,7 +154,13 @@ def test_end_to_end(tmp_path: Path, since_home_dir: Path) -> None:
         con.execute("delete from purchase_orders where po_no = '4500104'")
         con.commit()
     (docs / "new.csv").write_text("a,b\n1,2\n", encoding="utf-8")
-    (docs / "notes.txt").write_text("todo one\ntodo two\n", encoding="utf-8")
+    # Long enough that the step-6 digest overflows the 200-token minimum budget even without a
+    # "daemon not running" line (`daemon --once` now leaves its heartbeat, D16).
+    (docs / "notes.txt").write_text(
+        "todo one\ntodo two: call the supplier about the delayed shipment\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     (docs / "old.txt").unlink()
     (docs / "drafts" / "wip2.txt").write_text("more work in progress\n", encoding="utf-8")
 
@@ -192,7 +198,8 @@ def test_end_to_end(tmp_path: Path, since_home_dir: Path) -> None:
     ]
     doc_events = event_lines(digest, "[normal] docs")
     assert [re.sub(r"  since://evt/\d+$", "", line) for line in doc_events] == [
-        '  ~ "notes.txt" size: "10" -> "20"; text: "todo one" -> "todo one todo two"',
+        '  ~ "notes.txt" size: "9" -> "64"; text: "todo one" -> '
+        '"todo one todo two: call the supplier about the delayed shipment"',
         '  - "old.txt" removed',
         '  + "new.csv"',
         "  = baseline: 2 records",

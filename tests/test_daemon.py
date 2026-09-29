@@ -13,7 +13,9 @@ from typing import Any
 import pytest
 
 import since.daemon as daemon_mod
+from since.collect import run_collection
 from since.config import Config, SourceConfig
+from since.daemon import META_HEARTBEAT as HEARTBEAT
 from since.daemon import Daemon, DaemonError
 from since.model import KIND_BASELINE, KIND_SOURCE_ERROR, KIND_SOURCE_RECOVERED, Record
 from since.store import Store
@@ -362,6 +364,117 @@ def test_heartbeat_is_written_on_every_tick(
     assert store.get_meta("daemon_heartbeat_at") == stamp(7)
 
 
+def _slow_collect(
+    clock: Clock, seconds: float, seen: Callable[[], None] | None = None
+) -> Callable[[], list[Record]]:
+    def collect() -> list[Record]:
+        if seen is not None:
+            seen()
+        clock.advance(seconds)  # a long collection
+        return []
+
+    return collect
+
+
+def test_heartbeat_is_refreshed_with_the_current_time_before_every_source_run(
+    store: Store, make_daemon: Callable[..., Daemon], fake: FakeCollector, clock: Clock
+) -> None:
+    seen: dict[str, str | None] = {}
+    for source_id in "abc":
+        fake.results[source_id] = _slow_collect(
+            clock, 100, lambda sid=source_id: seen.update({sid: store.get_meta(HEARTBEAT)})
+        )
+    d = make_daemon(src("a"), src("b"), src("c"))
+    d.start()
+
+    assert d.tick(at(0)) == ["a", "b", "c"]
+
+    # each source started right after a fresh clock reading, not at the tick's start time
+    assert seen == {"a": stamp(0), "b": stamp(100), "c": stamp(200)}
+
+
+def test_a_second_daemon_is_refused_between_long_collections(
+    make_daemon: Callable[..., Daemon], fake: FakeCollector, clock: Clock
+) -> None:
+    second = make_daemon(src("b"), pid=1002)
+    outcomes: list[str] = []
+
+    def second_start_attempt() -> None:
+        try:
+            second.start()
+        except DaemonError:
+            outcomes.append("refused")
+        else:
+            outcomes.append("started")
+
+    fake.results["a"] = _slow_collect(clock, 100)  # takes far longer than the 30s window
+    fake.results["b"] = _slow_collect(clock, 0, second_start_attempt)
+    d = make_daemon(src("a"), src("b"), pid=1001)
+    d.start()
+
+    d.tick(at(0))
+
+    assert outcomes == ["refused"]  # the heartbeat written before b's run is only 0s old
+
+
+def test_a_failing_heartbeat_write_is_isolated_like_any_store_error(
+    store: Store,
+    make_daemon: Callable[..., Daemon],
+    monkeypatch: pytest.MonkeyPatch,
+    log: io.StringIO,
+) -> None:
+    real_set_meta = store.set_meta
+    calls = {"n": 0}
+
+    def flaky(key: str, value: Any) -> None:
+        if key == HEARTBEAT:
+            calls["n"] += 1
+            if calls["n"] == 2:  # 1st = start(); 2nd = before source "a"
+                raise sqlite3.OperationalError("database is locked")
+        real_set_meta(key, value)
+
+    d = make_daemon(src("a"), src("b"))
+    monkeypatch.setattr(store, "set_meta", flaky)
+    d.start()
+
+    assert d.tick(at(0)) == ["a", "b"]
+
+    assert kinds(store, "a") == []
+    assert kinds(store, "b") == [KIND_BASELINE]
+    assert log_lines(log) == [
+        f"{stamp(0)} a: run failed: OperationalError: database is locked",
+        f"{stamp(0)} b: 1 events",
+    ]
+
+
+def test_a_superseded_run_is_not_logged_and_counts_as_attempted(
+    store: Store,
+    make_daemon: Callable[..., Daemon],
+    fake: FakeCollector,
+    clock: Clock,
+    log: io.StringIO,
+) -> None:
+    cfg = src("a", 60)
+    newer = FakeCollector(clock)
+
+    def overtaken() -> list[Record]:
+        # While this run reads its source, a newer collection (e.g. `since collect`) stores its
+        # result; this run's older result must be dropped.
+        assert run_collection(store, cfg, newer, at(500)).superseded is False
+        return [rec("k", v=1)]
+
+    fake.results["a"] = overtaken
+    d = make_daemon(cfg)
+    d.start()
+
+    assert d.tick(at(0)) == ["a"]
+
+    assert log_lines(log) == []
+    assert kinds(store, "a") == [KIND_BASELINE]  # the newer run's only
+    assert store.get_snapshot("a") == {}  # ...not the overtaken run's record
+    assert d.tick(at(60)) == []  # the newer run's time counts for the schedule
+
+
 # -- tick: pruning -------------------------------------------------------------------------------
 
 
@@ -564,14 +677,54 @@ def test_once_runs_every_source_regardless_of_due_then_cleans_up(
     assert ("daemon_heartbeat_at", stamp(0)) in meta_writes
     assert store.get_meta("last_pruned_at") == stamp(0)  # prune-if-due ran
     assert sleeper.calls == []
-    assert store.get_meta("daemon_heartbeat_at") is None
-    assert store.get_meta("daemon_pid") is None
+    assert store.get_meta("daemon_heartbeat_at") == stamp(0)  # D16: --once keeps its heartbeat
+    assert store.get_meta("daemon_pid") is None  # ...but not the claim on being the running daemon
     for source_id in "ab":
         assert kinds(store, source_id) == [KIND_BASELINE]
 
     # not due for another day, yet once-mode runs them again
     assert make_daemon(src("b", 86400), src("a", 86400)).run(once=True) == 0
     assert fake.called == ["a", "b", "a", "b"]
+
+
+def test_once_keeps_the_last_heartbeat_and_a_later_daemon_may_start(
+    store: Store, make_daemon: Callable[..., Daemon], clock: Clock
+) -> None:
+    clock.advance(5)
+    assert make_daemon(src("a"), pid=1001).run(once=True) == 0
+    assert store.get_meta("daemon_pid") is None
+    assert store.get_meta("daemon_heartbeat_at") == stamp(5)
+
+    clock.advance(1)  # well inside the 30s window: the leftover heartbeat does not block a start
+    make_daemon(src("a"), pid=1002).start()
+    assert store.get_meta("daemon_pid") == "1002"
+
+
+def test_once_with_an_unexpected_error_still_keeps_only_the_heartbeat(
+    store: Store, make_daemon: Callable[..., Daemon], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = make_daemon(src("a"))
+
+    def broken(now: datetime) -> None:
+        raise RuntimeError("prune exploded")
+
+    monkeypatch.setattr(d, "_finish_tick", broken)
+    with pytest.raises(RuntimeError, match="prune exploded"):
+        d.run(once=True)
+    assert store.get_meta("daemon_pid") is None
+    assert store.get_meta("daemon_heartbeat_at") == stamp(0)
+
+
+def test_once_does_not_clear_the_pid_of_a_daemon_that_took_over(
+    store: Store, make_daemon: Callable[..., Daemon], fake: FakeCollector
+) -> None:
+    def takeover() -> list[Record]:
+        store.set_meta("daemon_pid", "2000")  # another daemon claimed the meta meanwhile
+        return []
+
+    fake.results["a"] = takeover
+    assert make_daemon(src("a")).run(once=True) == 0
+    assert store.get_meta("daemon_pid") == "2000"
 
 
 def test_once_survives_a_failing_source(
