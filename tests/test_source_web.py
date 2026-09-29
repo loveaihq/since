@@ -3,10 +3,11 @@
 Three layers:
 
 - pure Python (validation, result interpretation, fingerprint hashing): no browser;
-- a fake Playwright (error mapping, "always closed"): no browser;
+- a fake Playwright (error mapping, "always closed", ``since login``): no browser;
 - a real headless browser against a local ``http.server`` page, driven through ``run_collection``.
   The browser is Playwright's Chromium unless ``SINCE_TEST_BROWSER_CHANNEL`` names an installed
-  one (``msedge`` on Windows dev boxes). If no browser can be launched these tests skip.
+  one (``msedge`` on Windows dev boxes). If no browser can be launched these tests skip; on CI
+  (``CI`` is set) that is a failure, because CI installs Chromium.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
+from login_fake import FakeApi, FakeError
 
 from since.collect import CollectResult, register_sources, run_collection
 from since.config import Config, ConfigError, SourceConfig
@@ -40,6 +42,8 @@ from since.model import (
 from since.paths import since_home
 from since.sources import CollectError, CollectOutput
 from since.sources.web import (
+    PROFILE_IN_USE,
+    LoginError,
     WebCollector,
     _Field,
     _interpret,
@@ -48,6 +52,7 @@ from since.sources.web import (
     _profile_dir,
     _read_page,
     fingerprint_of,
+    login,
     split_field_selector,
 )
 from since.store import Store
@@ -716,6 +721,128 @@ def test_a_failed_run_after_a_baseline_removes_nothing(
     assert len(store.get_snapshot(SOURCE_ID)) == 2
 
 
+# -- since login (D19): fake Playwright ----------------------------------------------------------
+
+
+def login_cfg(**options: Any) -> SourceConfig:
+    return make_cfg(browser_channel="msedge", timeout_s=7, **options)
+
+
+def test_login_opens_the_collectors_profile_headed_and_waits_for_the_close() -> None:
+    api = FakeApi()
+    opened: list[str] = []
+    login(login_cfg(), on_open=lambda: opened.append("open"), api=api)
+
+    cfg = login_cfg()
+    assert api.launched == {
+        "profile": str(_profile_dir(cfg, _parse_options(cfg))),  # the very profile collect uses
+        "headless": False,
+        "channel": "msedge",
+    }
+    assert api.launched["profile"] == str(since_home() / "profiles" / SOURCE_ID)
+    assert Path(api.launched["profile"]).is_dir()
+    # The url is opened and nothing else is done to the page (the fake page has no other method);
+    # then the browser is shut down.
+    assert api.calls == [
+        "launch",
+        "goto https://example.invalid/orders commit 7000",
+        "wait_for_event close 1000",
+        "context.close",
+        "stop",
+    ]
+    assert opened == ["open"]
+
+
+def test_login_uses_an_explicit_profile_dir_and_the_default_browser(tmp_path: Path) -> None:
+    api = FakeApi()
+    profile = tmp_path / "my-profile"
+    cfg = replace_options(login_cfg(profile_dir=str(profile)), browser_channel=None)
+    login(cfg, api=api)
+    assert api.launched == {"profile": str(profile), "headless": False, "channel": None}
+    assert profile.is_dir()
+
+
+def test_login_keeps_waiting_until_the_user_closes_the_browser() -> None:
+    api = FakeApi(["timeout", "timeout", "close"])
+    login(login_cfg(), api=api)
+    assert api.calls.count("wait_for_event close 1000") == 3
+    assert api.context is not None and api.context.closed == 1
+
+
+def test_login_ends_when_the_last_window_is_gone_even_if_the_browser_stays_up() -> None:
+    api = FakeApi(["timeout", "no-pages"])  # macOS: closing the last window keeps the process
+    login(login_cfg(), api=api)
+    assert api.calls.count("wait_for_event close 1000") == 2
+    assert api.context is not None and api.context.closed == 1 and api.stopped == 1
+
+
+def test_login_returns_when_the_browser_was_already_closed_or_ctrl_c_is_pressed() -> None:
+    for script in (["gone"], ["interrupt"]):
+        api = FakeApi(script)
+        login(login_cfg(), api=api)
+        assert api.context is not None and api.context.closed == 1 and api.stopped == 1
+
+
+def test_login_survives_a_page_that_does_not_load() -> None:
+    # The window stays usable (the human can type the address); no error, still waits.
+    api = FakeApi(goto_error=FakeError("net::ERR_NAME_NOT_RESOLVED"))
+    login(login_cfg(), api=api)
+    assert "wait_for_event close 1000" in api.calls and api.stopped == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "BrowserType.launch_persistent_context: Target page, context or browser has been closed\n"
+        "Call log:\n  - [pid=11392] <process did exit: exitCode=21, signal=null>",
+        "BrowserType.launch_persistent_context: Target page, context or browser has been closed\n"
+        "Browser logs:\nOpening in existing browser session.",
+        "Failed to create a ProcessSingleton for your profile directory",
+    ],
+)
+def test_login_reports_a_locked_profile(message: str) -> None:
+    api = FakeApi(launch_error=FakeError(message))
+    with pytest.raises(LoginError) as info:
+        login(login_cfg(), api=api)
+    assert str(info.value) == PROFILE_IN_USE
+    assert PROFILE_IN_USE == "profile in use (the daemon may be collecting); try again in a minute"
+    assert api.stopped == 1
+
+
+def test_login_reports_other_launch_failures_briefly() -> None:
+    message = (
+        "BrowserType.launch_persistent_context: Executable doesn't exist at C:\\pw\\chrome.exe\n"
+        "Call log:\n  - lots\n  - of\n  - noise"
+    )
+    with pytest.raises(LoginError) as info:
+        login(login_cfg(), api=FakeApi(launch_error=FakeError(message)))
+    assert str(info.value) == (
+        "BrowserType.launch_persistent_context: Executable doesn't exist "
+        "(run `playwright install chromium`)"
+    )
+    url = "https://example.invalid/orders?token=SECRET"
+    error = FakeError(f"Missing X server. {url}")
+    with pytest.raises(LoginError) as info:
+        login(login_cfg(url=url), api=FakeApi(launch_error=error))
+    assert "SECRET" not in str(info.value) and "<url>" in str(info.value)
+
+
+def test_login_without_playwright_says_how_to_install_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing() -> Any:
+        raise CollectError("Playwright is not installed: install since[web]")
+
+    monkeypatch.setattr("since.sources.web._import_playwright", missing)
+    with pytest.raises(LoginError, match=r"since\[web\]"):
+        login(login_cfg())
+
+
+def test_login_rejects_an_invalid_web_config_before_launching() -> None:
+    api = FakeApi()
+    with pytest.raises(ConfigError, match="extract"):
+        login(replace(login_cfg(), options={"url": "https://example.invalid/"}), api=api)
+    assert api.calls == []
+
+
 # -- real browser --------------------------------------------------------------------------------
 
 
@@ -729,10 +856,13 @@ def browser_ok() -> None:
         pw.chromium.launch(headless=True, channel=CHANNEL).close()
     except Exception as exc:
         first = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
-        pytest.skip(
+        reason = (
             "no browser can be launched (run `playwright install chromium`, or set "
             f"SINCE_TEST_BROWSER_CHANNEL=msedge): {first[:150]}"
         )
+        if os.environ.get("CI"):  # CI installs Chromium: a browser that will not start is a failure
+            pytest.fail(reason)
+        pytest.skip(reason)
     finally:
         if pw is not None:
             with contextlib.suppress(Exception):
@@ -1160,3 +1290,93 @@ def test_extraction_reads_text_attributes_and_reports_broken_selectors(browser: 
     assert "td:nth-child(" in str(info.value)
     with pytest.raises(CollectError):
         browser.snap(html, rows="table[")
+
+
+# -- since login: real browser -------------------------------------------------------------------
+
+
+class _Delegate:
+    def __init__(self, real: Any) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+class _LoginContext(_Delegate):
+    """The real context, closed from inside the wait like a user closing the window would."""
+
+    def __init__(self, real: Any) -> None:
+        super().__init__(real)
+        self.polls = 0
+        self.url_when_waiting = ""
+
+    def wait_for_event(self, event: str, timeout: int) -> Any:
+        self.polls += 1
+        if self.polls == 1:
+            page = self._real.pages[0]
+            self.url_when_waiting = page.url
+            page.once("console", lambda _msg: self._real.close())
+            page.evaluate("() => setTimeout(() => console.log('bye'), 200)")
+        elif self.polls > 20:  # never hang the test run
+            self._real.close()
+        return self._real.wait_for_event(event, timeout=timeout)
+
+
+class _LoginChromium(_Delegate):
+    def __init__(self, real: Any, launches: list[dict[str, Any]], contexts: list[Any]) -> None:
+        super().__init__(real)
+        self._launches = launches
+        self._contexts = contexts
+
+    def launch_persistent_context(self, profile: str, **kwargs: Any) -> Any:
+        self._launches.append({"profile": profile, **kwargs})
+        # A CI machine has no display to open a window on: run the real browser headless.
+        context = _LoginContext(
+            self._real.launch_persistent_context(profile, **{**kwargs, "headless": True})
+        )
+        self._contexts.append(context)
+        return context
+
+
+class _LoginPlaywright(_Delegate):
+    def __init__(self, real: Any, launches: list[dict[str, Any]], contexts: list[Any]) -> None:
+        super().__init__(real)
+        self.chromium = _LoginChromium(real.chromium, launches, contexts)
+
+
+class _LoginApi(_Delegate):
+    """``playwright.sync_api`` with the launches recorded (and forced headless)."""
+
+    def __init__(self, real: Any) -> None:
+        super().__init__(real)
+        self.launches: list[dict[str, Any]] = []
+        self.contexts: list[Any] = []
+
+    def sync_playwright(self) -> Any:
+        manager = self._real.sync_playwright()
+        api = self
+
+        class Manager:
+            def start(self) -> Any:
+                return _LoginPlaywright(manager.start(), api.launches, api.contexts)
+
+        return Manager()
+
+
+def test_login_with_a_real_browser_opens_the_page_and_returns_when_it_is_closed(
+    site: Site,
+) -> None:
+    site.write("orders.html", orders_html(ROWS))
+    api = _LoginApi(pytest.importorskip("playwright.sync_api"))
+    opened: list[str] = []
+
+    login(make_cfg(url=site.url()), on_open=lambda: opened.append("open"), api=api)
+
+    profile = since_home() / "profiles" / SOURCE_ID
+    assert api.launches == [{"profile": str(profile), "headless": False, "channel": CHANNEL}]
+    assert opened == ["open"]
+    assert profile.is_dir() and any(profile.iterdir())  # the browser really used it
+    (context,) = api.contexts
+    assert context.polls >= 1
+    assert context.url_when_waiting.startswith(site.url())

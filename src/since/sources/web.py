@@ -49,7 +49,7 @@ import contextlib
 import hashlib
 import os
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -84,6 +84,21 @@ _NOT_INSTALLED = (
     "Playwright is not installed: install since[web] and run `playwright install chromium`"
 )
 _MAX_MESSAGE_CHARS = 200
+
+PROFILE_IN_USE = "profile in use (the daemon may be collecting); try again in a minute"
+_LOGIN_POLL_MS = 1000  # how often ``login`` looks whether the last window is gone
+# What a Chromium that cannot take over a profile another process holds leaves in the Playwright
+# error (which carries the browser's log and exit status). Compared lower-case. Windows: exit code
+# 21 (Chromium's RESULT_CODE_PROFILE_IN_USE; observed with Edge); elsewhere the "Opening in
+# existing browser session." line Chromium prints when it hands over to the running instance.
+_PROFILE_LOCK_MARKERS = (
+    "exitcode=21,",
+    "opening in existing browser session",
+    "processsingleton",
+    "singletonlock",
+    "in use by another",
+    "already in use",
+)
 
 # ``selector@attr``: the attribute name must follow the LAST "@" up to the end of the string, and
 # the selector must not end in a backslash (``.a\@b`` is an escaped "@", not an attribute).
@@ -478,6 +493,80 @@ def _profile_dir(cfg: SourceConfig, opts: _Options) -> Path:
         if os.name == "posix":
             os.chmod(path, 0o700)
     return path
+
+
+# -- since login (D19) ---------------------------------------------------------------------------
+
+
+class LoginError(Exception):
+    """``since login`` could not open the browser; ``str(exc)`` is a short message for the human."""
+
+
+def _profile_locked(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _PROFILE_LOCK_MARKERS)
+
+
+def _wait_until_closed(api: Any, context: Any) -> None:
+    """Block until the user closed the browser. Both the context's ``close`` event and "no window
+    left" count: on macOS closing the last window leaves the browser process running."""
+    while True:
+        try:
+            context.wait_for_event("close", timeout=_LOGIN_POLL_MS)
+            return
+        except api.TimeoutError:
+            if not context.pages:
+                return
+        except api.Error:
+            return  # the context is already gone
+
+
+def login(cfg: SourceConfig, on_open: Callable[[], None] | None = None, api: Any = None) -> None:
+    """Open the source's persistent profile in a HEADED browser at its ``url`` and wait until the
+    human closed it (D19). The profile is the one the collector reads, so what they log in to here
+    is what the daemon sees. Nothing is ever typed into or clicked on the page.
+
+    ``on_open`` is called once the window is up (the CLI prints its instructions there); ``api``
+    replaces ``playwright.sync_api`` (tests). ``ConfigError`` for an invalid web config;
+    ``LoginError`` if there is no Playwright, the profile is locked (the daemon is collecting) or
+    the browser cannot start."""
+    opts = _parse_options(cfg)
+    if api is None:
+        try:
+            api = _import_playwright()
+        except CollectError as exc:
+            raise LoginError(str(exc)) from None
+    profile = _profile_dir(cfg, opts)
+
+    pw = context = None
+    try:
+        pw = api.sync_playwright().start()
+        context = pw.chromium.launch_persistent_context(
+            str(profile), headless=False, channel=opts.browser_channel
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        if on_open is not None:
+            on_open()
+        try:
+            # "commit" returns as soon as the server answered; a slow or failing page must not
+            # stop the human from using the window (they can type the address themselves).
+            page.goto(opts.url, wait_until="commit", timeout=opts.timeout_s * 1000)
+        except api.Error:
+            pass
+        _wait_until_closed(api, context)
+    except KeyboardInterrupt:
+        pass  # Ctrl-C in the terminal = "I'm done"; the browser is closed below
+    except api.Error as exc:
+        if _profile_locked(exc):
+            raise LoginError(PROFILE_IN_USE) from None
+        raise LoginError(_describe(exc, opts.url)) from None
+    finally:
+        if context is not None:
+            with contextlib.suppress(Exception):
+                context.close()
+        if pw is not None:
+            with contextlib.suppress(Exception):
+                pw.stop()
 
 
 class WebCollector:

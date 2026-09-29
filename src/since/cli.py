@@ -1,4 +1,4 @@
-"""Command-line entry point: ``since daemon|mcp|collect|digest|get|ack|status``.
+"""Command-line entry point: ``since daemon|mcp|collect|login|digest|get|ack|status``.
 
 ``digest`` / ``get`` / ``ack`` / ``status`` read only the database (no config file needed) and
 print exactly what the MCP tools return. Exit codes: 0 ok; 1 collection failure, service error
@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 from since.collect import register_sources, run_collection
-from since.config import ConfigError, load_config
+from since.config import Config, ConfigError, SourceConfig, load_config
 from since.daemon import Daemon, DaemonError
 from since.sanitize import GET_CAP, q
 from since.service import Service
@@ -37,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("mcp", help="run the MCP server on stdio")
 
     p = sub.add_parser("collect", help="collect one source once (debug)")
+    p.add_argument("source_id")
+
+    p = sub.add_parser("login", help="log in to a web source once, by hand, in a browser window")
     p.add_argument("source_id")
 
     p = sub.add_parser("digest", help="print the digest an agent would get")
@@ -98,12 +101,20 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _unknown_source(config: Config, source_id: str) -> str | None:
+    """An error message if ``source_id`` is not configured, else ``None``."""
+    if any(cfg.id == source_id for cfg in config.sources):
+        return None
+    known = ", ".join(cfg.id for cfg in config.sources) or "none"
+    return f"unknown source '{source_id}' (configured: {known})"
+
+
 def _cmd_collect(args: argparse.Namespace) -> int:
     source_id: str = args.source_id
     config = load_config()
-    if all(cfg.id != source_id for cfg in config.sources):
-        known = ", ".join(cfg.id for cfg in config.sources) or "none"
-        return _fail(f"unknown source '{source_id}' (configured: {known})", 2)
+    unknown = _unknown_source(config, source_id)
+    if unknown is not None:
+        return _fail(unknown, 2)
     store = Store.open()
     try:
         registration = register_sources(store, config)
@@ -124,6 +135,30 @@ def _cmd_collect(args: argparse.Namespace) -> int:
         print(f"{source_id}: {len(result.seqs)} events (seq {result.seqs[0]}-{result.seqs[-1]})")
     else:
         print(f"{source_id}: no changes")
+    return 0
+
+
+def _cmd_login(args: argparse.Namespace) -> int:
+    """D19: a headed browser on the web source's profile; the human logs in, then closes it."""
+    source_id: str = args.source_id
+    config = load_config()
+    unknown = _unknown_source(config, source_id)
+    if unknown is not None:
+        return _fail(unknown, 2)
+    cfg: SourceConfig = next(c for c in config.sources if c.id == source_id)
+    if cfg.type != "web":
+        return _fail(
+            f"source '{source_id}' is a {cfg.type} source; login is only for web sources", 2
+        )
+    from since.sources import web  # lazy: Playwright is an optional extra
+
+    def announce() -> None:
+        print(f"Log in to {source_id} in the browser window, then close it.", flush=True)
+
+    try:
+        web.login(cfg, on_open=announce)
+    except web.LoginError as exc:
+        return _fail(str(exc), 1)
     return 0
 
 
@@ -161,6 +196,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "daemon": _cmd_daemon,
     "mcp": _cmd_mcp,
     "collect": _cmd_collect,
+    "login": _cmd_login,
     "digest": _cmd_digest,
     "get": _cmd_get,
     "ack": _cmd_ack,

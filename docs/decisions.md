@@ -51,7 +51,8 @@ Small spec changes/clarifications made by the architect. Direction changes go to
   once as `schema_changed` with no selectors, then diffed normally.
 - **D19 (M2) `since login <source_id>`.** CLAUDE.md says the human logs in once manually into the persistent
   profile; this command opens that profile headed at the source URL and waits for the window to close. It
-  never fills anything in (auto-login stays a non-goal). It is the only Playwright use outside the daemon.
+  never fills anything in (auto-login stays a non-goal). It is the only Playwright use outside the daemon. It also ends when the
+  profile's last page is closed (on macOS closing the last window leaves the browser process running).
 - **D20 (M2) imap key and dedupe.** Key = Message-ID; a mail seen in several folders/labels (normal on Gmail)
   is kept once (first by folder order, then UID); missing Message-ID → `uid:<folder>/<uidvalidity>/<uid>`.
   Read-only: EXAMINE + BODY.PEEK only. Password via `password_env` (for Google Workspace an app password);

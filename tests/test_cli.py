@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from login_fake import FakeApi, FakeError
 
 import since.mcp_server
 from since.cli import main
@@ -124,17 +125,19 @@ def test_collect_unknown_source_exits_2_without_creating_the_database(
     assert not (since_home_dir / "since.db").exists()
 
 
-def test_collect_unimplemented_type_exits_2(
+def test_collect_of_a_registered_type_validates_its_options(
     since_home_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    write_config(since_home_dir, [{"id": "mail", "type": "imap"}])
+    write_config(since_home_dir, [{"id": "mail", "type": "imap"}])  # imap needs host & co
     code, out, err = run(capsys, "collect", "mail")
     assert code == 2
     assert out == ""
-    assert "mail" in err and "not implemented" in err
+    assert "mail" in err and "host" in err and "not implemented" not in err
 
 
-@pytest.mark.parametrize("argv", [["collect", "docs"], ["daemon", "--once"], ["daemon"]])
+@pytest.mark.parametrize(
+    "argv", [["collect", "docs"], ["daemon", "--once"], ["daemon"], ["login", "docs"]]
+)
 def test_missing_config_exits_2(
     argv: list[str], since_home_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -331,6 +334,94 @@ def test_second_daemon_is_refused_with_exit_1(
         assert store.events_after(0) == []
 
 
+# -- login ---------------------------------------------------------------------------------------
+
+
+def web_source(source_id: str = "portal", **options: Any) -> dict[str, Any]:
+    return {
+        "id": source_id,
+        "type": "web",
+        "url": "https://example.invalid/orders",
+        "extract": {"rows": "table tr", "key": "po", "fields": {"po": "td:nth-child(1)"}},
+        **options,
+    }
+
+
+@pytest.fixture
+def fake_browser(monkeypatch: pytest.MonkeyPatch) -> FakeApi:
+    api = FakeApi()
+    monkeypatch.setattr("since.sources.web._import_playwright", lambda: api)
+    return api
+
+
+def test_login_opens_the_profile_and_exits_0_when_the_window_is_closed(
+    since_home_dir: Path, fake_browser: FakeApi, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(since_home_dir, [web_source(browser_channel="msedge")])
+    assert run(capsys, "login", "portal") == (
+        0,
+        "Log in to portal in the browser window, then close it.\n",
+        "",
+    )
+    assert fake_browser.launched == {
+        "profile": str(since_home_dir / "profiles" / "portal"),
+        "headless": False,
+        "channel": "msedge",
+    }
+    assert fake_browser.calls[-2:] == ["context.close", "stop"]
+    assert not (since_home_dir / "since.db").exists()  # login never touches the database
+
+
+def test_login_unknown_source_exits_2(
+    config: Path, fake_browser: FakeApi, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(capsys, "login", "nope")
+    assert (code, out) == (2, "")
+    assert "unknown source 'nope'" in err and "docs" in err
+    assert fake_browser.calls == []
+
+
+def test_login_is_only_for_web_sources(
+    config: Path, fake_browser: FakeApi, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run(capsys, "login", "docs") == (
+        2,
+        "",
+        "error: source 'docs' is a dir source; login is only for web sources\n",
+    )
+    assert fake_browser.calls == []
+
+
+def test_login_profile_in_use_exits_1(
+    since_home_dir: Path, fake_browser: FakeApi, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(since_home_dir, [web_source()])
+    fake_browser.launch_error = FakeError("... <process did exit: exitCode=21, signal=null>")
+    assert run(capsys, "login", "portal") == (
+        1,
+        "",
+        "error: profile in use (the daemon may be collecting); try again in a minute\n",
+    )
+
+
+def test_login_other_browser_failure_exits_1_with_a_short_message(
+    since_home_dir: Path, fake_browser: FakeApi, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(since_home_dir, [web_source()])
+    fake_browser.launch_error = FakeError("Missing X server or $DISPLAY\nlong log\nlong log")
+    assert run(capsys, "login", "portal") == (1, "", "error: Missing X server or $DISPLAY\n")
+
+
+def test_login_invalid_web_options_exit_2(
+    since_home_dir: Path, fake_browser: FakeApi, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_config(since_home_dir, [web_source(url="ftp://example.invalid/")])
+    code, out, err = run(capsys, "login", "portal")
+    assert (code, out) == (2, "")
+    assert "portal" in err and "url" in err
+    assert fake_browser.calls == []
+
+
 # -- misc ----------------------------------------------------------------------------------------
 
 
@@ -342,7 +433,7 @@ def test_mcp_command_runs_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_usage_errors_exit_2() -> None:
-    for argv in ([], ["nonsense"], ["ack", "notanumber"], ["collect"]):
+    for argv in ([], ["nonsense"], ["ack", "notanumber"], ["collect"], ["login"]):
         with pytest.raises(SystemExit) as exc:
             main(argv)
         assert exc.value.code == 2

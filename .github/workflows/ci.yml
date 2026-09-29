@@ -23,5 +23,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --all-extras --locked
+      # The web tests drive a real Chromium: install Playwright's bundled one (on Linux with the
+      # system libraries it needs) so they run here instead of skipping.
+      - name: Install Chromium (Linux, with system dependencies)
+        if: runner.os == 'Linux'
+        run: uv run playwright install --with-deps chromium
+      - name: Install Chromium
+        if: runner.os != 'Linux'
+        run: uv run playwright install chromium
       - run: uv run ruff check .
       - run: uv run pytest -q -rs

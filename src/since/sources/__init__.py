@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from since.config import SourceConfig
-from since.model import SOURCE_TYPES, Record
+from since.model import Record
 
 
 class CollectError(Exception):
@@ -91,6 +91,9 @@ class Collector(Protocol):
 REGISTRY: dict[str, str] = {
     "dir": "since.sources.dir:DirCollector",
     "sql": "since.sources.sql:SqlCollector",
+    "imap": "since.sources.imap:ImapCollector",
+    "web": "since.sources.web:WebCollector",
+    "changedetection": "since.sources.changedetection:ChangedetectionCollector",
 }
 
 
@@ -104,14 +107,12 @@ def title_fields_for(cfg: SourceConfig, collector: Collector) -> list[str]:
 
 
 def get_collector(type_name: str) -> Collector:
-    """Return a new collector for a source type.
+    """Return a new collector for a source type; ``ValueError`` for a type Since does not know.
 
-    ``NotImplementedError`` for types that exist but have no collector yet (imap / web /
-    changedetection); ``ValueError`` for a type Since does not know at all."""
+    The concrete module is imported here, not with this package, so that a source type's optional
+    dependencies (Playwright, SQLAlchemy) are only needed when such a source is actually used."""
     target = REGISTRY.get(type_name)
     if target is None:
-        if type_name in SOURCE_TYPES:
-            raise NotImplementedError(f"source type '{type_name}' is not implemented yet")
         raise ValueError(f"unknown source type '{type_name}'")
     module_name, _, class_name = target.partition(":")
     cls = getattr(importlib.import_module(module_name), class_name)

@@ -8,8 +8,8 @@ token-expensive part of long-running work. Since watches and diffs locally with 
 hands the agent a ranked, token-budgeted digest of what changed since its cursor, with handles to
 drill down. Local-first: credentials never leave your machine.
 
-Status: **M1: core, `dir` + `sql` sources** (CLI, daemon, stdio MCP server). Not on PyPI yet.
-`imap`, `web` and `changedetection` sources are planned.
+Status: **M2: sources `dir`, `sql`, `imap`, `web` and `changedetection`** (CLI, daemon, stdio MCP
+server). Not on PyPI yet.
 
 ## Install
 
@@ -21,8 +21,9 @@ since --help
 ```
 
 The `[sql]` extra brings SQLAlchemy, which `sql` sources need (SQLite works out of the box; for
-other databases add their driver, e.g. `--with "psycopg[binary]"`). Without `sql` sources you can
-drop the extra.
+other databases add their driver, e.g. `--with "psycopg[binary]"`). The `[web]` extra brings
+Playwright, which `web` sources need (see [Web sources](#web-sources-logged-in-portals)); `imap`
+and `changedetection` need no extra. Without `sql` / `web` sources you can drop the extras.
 
 To hack on it instead: `uv sync --all-extras`, then run everything as `uv run since ...`
 (`uv run pytest -q`, `uv run ruff check .`).
@@ -57,6 +58,114 @@ holds the connection URL, and the config loader rejects `password`, `token` and 
 (`export SINCE_PO_DB_URL=postgresql+psycopg://user:pw@host/db`, or `$env:SINCE_PO_DB_URL = "..."`
 in PowerShell). Highlight rules are `equals`, `contains` or `changed_to`.
 
+`title_fields` (any source, 1-3 field names) chooses what a record is called in digests. A Message-ID
+or a UUID means nothing to an agent, so `imap` defaults to `[subject, from]` and `changedetection`
+to `[title]`; for the others the quoted key is the label unless you set `title_fields`
+(`title_fields: [po, supplier]` prints `"4500123" supplier "ACME Ltd"`).
+
+## Sources
+
+Every source takes the common keys above (`id`, `type`, `priority`, `schedule`, `track_fields`,
+`title_fields`, `highlight`). The keys below are specific to the type. Unknown keys are rejected.
+
+### `imap`: a mailbox
+
+```yaml
+sources:
+  - id: inbox
+    type: imap
+    priority: normal
+    schedule: every 5m
+    host: imap.gmail.com
+    port: 993                      # default: 993 for ssl, 143 otherwise
+    security: ssl                  # ssl (default) | starttls | none
+    username: me@example.com
+    password_env: SINCE_IMAP_PW    # NAME of an env var holding the password
+    folders: [INBOX]               # default; names are sent as IMAP folder names
+    since_days: 14                 # look back this far (1-365, default 14)
+    max_messages: 500              # per folder, newest first (1-5000, default 500)
+```
+
+Each mail of the last `since_days` days is a record (headers only, never the body): fields
+`subject`, `from`, `to`, `date`, `folder`, `seen`, `flagged`, `answered`, `size`. New mail shows up
+as `+`, a flag change as `~ ... seen: "False" -> "True"`, a deleted mail as `-`; mail that ages out of
+the window is dropped silently. A mail that sits in several folders (Gmail labels) counts once.
+The collector is read-only (`EXAMINE` and `BODY.PEEK` only): it never marks a mail as read.
+
+Gmail and Google Workspace: turn IMAP on in the account, enable 2-step verification and create an
+[app password](https://myaccount.google.com/apppasswords); put the app password (not your login
+password) into the environment variable named by `password_env`, in the environment of the daemon.
+Workspace admins may have to allow app passwords (OAuth is not supported yet). `security: none` is
+only accepted for `localhost` / `127.0.0.1` (a local mail bridge); it sends the password unencrypted.
+
+### `changedetection`: a changedetection.io instance
+
+```yaml
+sources:
+  - id: supplier-watches
+    type: changedetection
+    priority: high
+    url: http://localhost:5000     # base URL of the instance
+    api_key_env: CD_API_KEY        # optional: NAME of an env var holding the API key
+    tag: Suppliers                 # optional: only watches with this tag
+    fetch_text: true               # default: add the latest snapshot text as field `text`
+    timeout_s: 30                  # per request (1-300, default 30)
+```
+
+Each watch is a record (key: its UUID; fields `url`, `title`, `last_changed`, `last_error` and,
+with `fetch_text`, the latest snapshot `text`). Since reuses changedetection.io for the fetching and
+diffing of pages and adds ranking, budgets and the agent cursor on top: a changed page shows as
+`text: "..." -> "..."` or `text changed (+a/-b chars)`.
+
+### Web sources (logged-in portals)
+
+```yaml
+sources:
+  - id: sps-portal
+    type: web
+    priority: high
+    schedule: every 30m
+    url: https://portal.example.com/orders
+    login_detect: {url_contains: /login}   # or {selector: "form#login"}
+    extract:
+      rows: "table#orders tbody tr"        # one record per match
+      key: po                              # one of the fields below; rows with an empty key are skipped
+      fields:
+        po: "td:nth-child(1)"
+        supplier: "td:nth-child(2)"
+        status: "td:nth-child(4)"
+        link: "a.detail@href"              # selector@attr reads an attribute instead of the text
+      container: "table#orders"            # optional: must exist; then zero rows is valid data
+    wait_for: "table#orders"               # optional: wait for this element after the page loads
+    title_fields: [po, supplier]
+    track_fields: [status]
+    profile_dir: ~/.since/profiles/sps     # default: <SINCE_HOME>/profiles/<id>
+    browser_channel: msedge                # msedge | chrome; default: Playwright's Chromium
+    timeout_s: 30                          # 1-300, default 30
+    fingerprint_depth: 8                   # 0-32, default 8; 0 turns layout tracking off
+```
+
+Since reads the page in a browser profile that you log in to by hand once; it never types a
+password and has no auto-login. Setup:
+
+```sh
+uv tool install --with-executables-from playwright ".[web,sql]"   # from a checkout; or since[web]
+playwright install chromium     # Playwright's own Chromium (~150 MB); skip it with browser_channel: msedge
+since login sps-portal          # once: a browser window opens on the source's url; log in, close it
+since daemon                    # from now on the daemon reads the page headless with that profile
+```
+
+`msedge` (always present on Windows) or `chrome` uses the browser already installed instead of the
+download. `since login` works for `web` sources only; if the daemon happens to be collecting right
+then it says `profile in use (the daemon may be collecting); try again in a minute`. When the
+session expires, `login_detect` turns the failure into `! source_error: "login expired"`; run
+`since login <id>` again.
+
+Layout changes are reported instead of guessed at: if an extractor selector stops matching, the
+source gets `! schema_changed: 1 extractor selector matches 0 rows (...)` and no record is marked
+removed; a structural change that leaves all selectors working is reported once as `page layout
+changed`. Both are compared with a fingerprint of the page's tags and classes (never its text).
+
 ## Run
 
 ```sh
@@ -65,6 +174,7 @@ since daemon --once   # collect every source once and exit (the first run is the
 since status          # per source: last success, current error, record count; daemon heartbeat
 since digest          # what an agent would see right now
 since collect docs    # collect a single source once (debugging)
+since login sps-portal   # log in to a web source by hand, once (see Web sources)
 ```
 
 The first successful collection of a source records one `baseline` event, never one `added` event

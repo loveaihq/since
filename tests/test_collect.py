@@ -31,6 +31,7 @@ from since.model import (
     KIND_SOURCE_RECOVERED,
     KIND_WEIGHT,
     PRIORITY_WEIGHT,
+    SOURCE_TYPES,
     FieldChange,
     Record,
 )
@@ -146,10 +147,9 @@ def kinds(store: Store, source_id: str = "src") -> list[tuple[str, str | None]]:
 # -- registry ------------------------------------------------------------------------------------
 
 
-def test_get_collector_unimplemented_types_raise_not_implemented() -> None:
-    for type_name in ("imap", "web", "changedetection"):
-        with pytest.raises(NotImplementedError, match=type_name):
-            get_collector(type_name)
+def test_get_collector_knows_every_source_type() -> None:
+    for type_name in SOURCE_TYPES:
+        assert get_collector(type_name).type_name == type_name
 
 
 def test_get_collector_unknown_type_is_value_error() -> None:
@@ -157,17 +157,23 @@ def test_get_collector_unknown_type_is_value_error() -> None:
         get_collector("nope")
 
 
-def test_registry_maps_the_implemented_types_lazily() -> None:
+def test_registry_maps_every_source_type_lazily() -> None:
     assert sources.REGISTRY == {
         "dir": "since.sources.dir:DirCollector",
         "sql": "since.sources.sql:SqlCollector",
+        "imap": "since.sources.imap:ImapCollector",
+        "web": "since.sources.web:WebCollector",
+        "changedetection": "since.sources.changedetection:ChangedetectionCollector",
     }
-    # Importing the package must not import the concrete collectors (they may need extras).
+    assert set(sources.REGISTRY) == set(SOURCE_TYPES)
+    # Importing the package (and the runner and CLI on top of it) must not import the concrete
+    # collectors or what they need: an unused source type costs nothing, and a missing extra
+    # (Playwright, SQLAlchemy) only matters to the sources that use it.
     code = (
-        "import sys, since.sources, since.collect; "
-        "assert 'since.sources.dir' not in sys.modules; "
-        "assert 'since.sources.sql' not in sys.modules; "
-        "assert 'sqlalchemy' not in sys.modules"
+        "import sys, since.sources, since.collect, since.cli; "
+        "loaded = set(sys.modules); "
+        "assert not [m for m in loaded if m.startswith('since.sources.')], sorted(loaded); "
+        "assert not {'sqlalchemy', 'playwright', 'imaplib'} & loaded, sorted(loaded)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
 
@@ -212,7 +218,7 @@ def test_register_upserts_sources_with_key_label_and_marks_configured(store: Sto
     assert stale is not None and stale.configured is False
 
 
-def test_register_skips_unimplemented_types_with_reason(store: Store) -> None:
+def test_register_skips_types_missing_from_the_given_collectors(store: Store) -> None:
     config = Config(sources=[make_cfg("docs"), make_cfg("mail", type="imap")])
 
     reg = register_sources(store, config, {"dir": FakeCollector()})
@@ -228,9 +234,16 @@ def test_register_skips_unimplemented_types_with_reason(store: Store) -> None:
 
 
 def test_register_uses_builtin_registry_when_no_collectors_given(store: Store) -> None:
-    reg = register_sources(store, Config(sources=[make_cfg("mail", type="imap")]))
-    assert reg.collectable == []
-    assert [sid for sid, _ in reg.skipped] == ["mail"]
+    mail = SourceConfig(
+        id="mail",
+        type="imap",
+        options={"host": "imap.example.com", "username": "me", "password_env": "PW"},
+    )
+    reg = register_sources(store, Config(sources=[mail]))
+    assert [(cfg.id, c.type_name) for cfg, c in reg.collectable] == [("mail", "imap")]
+    assert reg.skipped == []
+    with pytest.raises(ConfigError, match="host"):  # the built-in imap collector validates
+        register_sources(store, Config(sources=[make_cfg("bad", type="imap")]))
 
 
 def test_register_reflects_config_changes_but_keeps_collection_state(store: Store) -> None:
