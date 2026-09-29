@@ -27,9 +27,10 @@ from since.model import (
     KIND_SOURCE_ERROR,
     KIND_SOURCE_RECOVERED,
     Record,
+    Scalar,
 )
 from since.sanitize import q
-from since.sources import CollectError, Collector, CollectOutput, get_collector
+from since.sources import CollectError, Collector, CollectOutput, get_collector, title_fields_for
 from since.store import SourceState, Store
 from since.timeutil import from_iso
 
@@ -228,10 +229,11 @@ def run_collection(
     If the stored state shows an attempt later than ``now`` (a newer run already committed), the
     result is dropped and ``CollectResult(superseded=True)`` returned (D15)."""
     try:
+        title_fields = title_fields_for(cfg, collector)
         records, unavailable = _check_output(collector.collect(cfg))
     except Exception as exc:
         return _store_failure(store, cfg, collector, now, _failure_message(exc))
-    return _store_success(store, cfg, collector, now, records, unavailable)
+    return _store_success(store, cfg, collector, now, records, unavailable, title_fields)
 
 
 def _superseded(state: SourceState, now: datetime) -> bool:
@@ -281,6 +283,7 @@ def _store_success(
     now: datetime,
     records: list[Record],
     unavailable: list[str],
+    title_fields: list[str],
 ) -> CollectResult:
     seqs: list[int] = []
     with store.transaction():
@@ -314,18 +317,38 @@ def _store_success(
             cols["baselined"] = True
             cols["record_count"] = len(records)  # unavailable keys are left out of a baseline
         else:
-            diff_seqs, count = _store_diff(store, cfg, now, records, unavailable)
+            diff_seqs, count = _store_diff(store, cfg, now, records, unavailable, title_fields)
             seqs.extend(diff_seqs)
             cols["record_count"] = count
         store.update_source_state(cfg.id, **cols)
     return CollectResult(seqs, None)
 
 
+def _title_detail(title_fields: list[str], fields: Mapping[str, Scalar]) -> dict[str, object]:
+    """``{"title": [[field, value], ...]}`` for the title fields present in ``fields``, in
+    title-field order (D17); ``{}`` when there is none, so untitled events look as before."""
+    title = [[name, _short(fields[name])] for name in title_fields if name in fields]
+    return {"title": title} if title else {}
+
+
+def _short(value: Scalar) -> Scalar:
+    """Title values are labels: a long text field configured as a title is stored cut to 200."""
+    return value[:200] if isinstance(value, str) else value
+
+
 def _store_diff(
-    store: Store, cfg: SourceConfig, now: datetime, records: list[Record], unavailable: list[str]
+    store: Store,
+    cfg: SourceConfig,
+    now: datetime,
+    records: list[Record],
+    unavailable: list[str],
+    title_fields: list[str],
 ) -> tuple[list[int], int]:
     """Diff against the stored snapshot, append the events and bring the snapshot up to date.
     Returns the event seqs and the number of records present afterwards.
+
+    Added/modified/removed events carry ``detail["title"]``: the title fields of the new record
+    (added/modified) or of the last known record (removed).
 
     Unavailable keys that are in the snapshot are carried forward: hidden from the diff (so they
     are neither modified nor removed) and their snapshot rows left untouched. Unavailable keys
@@ -342,6 +365,7 @@ def _store_diff(
             record_key=draft.key,
             field_changes=draft.changes,
             importance=score(cfg.priority, draft.kind, draft.changes, draft.fields, cfg.highlight),
+            detail=_title_detail(title_fields, draft.fields),
         )
         for draft in drafts
     ]

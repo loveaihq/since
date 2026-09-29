@@ -245,6 +245,52 @@ def test_track_fields_ok():
     assert src.track_fields == ["status", "eta"]
 
 
+# --- title_fields (D17) ----------------------------------------------------------------------
+
+
+def test_title_fields_default_is_none_and_not_an_option():
+    src = parse_config({"sources": [one()]}).sources[0]
+    assert src.title_fields is None
+    assert "title_fields" not in src.options
+
+
+@pytest.mark.parametrize("value", [["subject"], ["subject", "from"], ["a", "b", "c"]])
+def test_title_fields_ok_and_not_left_in_options(value):
+    src = parse_config({"sources": [one(title_fields=value, extra=1)]}).sources[0]
+    assert src.title_fields == value
+    assert src.options == {"path": "/tmp/docs", "extra": 1}  # title_fields is a core key
+
+
+def test_title_fields_null_means_default():
+    assert parse_config({"sources": [one(title_fields=None)]}).sources[0].title_fields is None
+
+
+def test_title_fields_are_independent_of_track_fields():
+    src = parse_config(
+        {"sources": [one(title_fields=["subject"], track_fields=["seen"])]}
+    ).sources[0]
+    assert (src.title_fields, src.track_fields) == (["subject"], ["seen"])
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "subject",  # not a list
+        [],  # 0 fields
+        ["a", "b", "c", "d"],  # more than 3
+        ["a", 1],
+        ["a", ""],
+        [None],
+        {"a": 1},
+        5,
+        True,
+    ],
+)
+def test_bad_title_fields(bad):
+    with pytest.raises(ConfigError, match=r"source 'docs'.*'title_fields'"):
+        parse_config({"sources": [one(title_fields=bad)]})
+
+
 @pytest.mark.parametrize("key", ["password", "passwd", "secret", "token", "api_key", "Password"])
 def test_credential_keys_rejected(key):
     with pytest.raises(ConfigError) as exc:

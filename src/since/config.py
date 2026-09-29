@@ -32,7 +32,11 @@ _CREDENTIAL_KEYS = frozenset({"password", "passwd", "secret", "token", "api_key"
 _CREDENTIAL_MSG = "credentials must come from an env var (url_env) or OS keyring, never YAML"
 
 # Source keys consumed by the core; everything else lands in ``SourceConfig.options``.
-_CORE_KEYS = frozenset({"id", "type", "priority", "schedule", "track_fields", "highlight"})
+_CORE_KEYS = frozenset(
+    {"id", "type", "priority", "schedule", "track_fields", "title_fields", "highlight"}
+)
+
+MAX_TITLE_FIELDS = 3
 
 
 class ConfigError(Exception):
@@ -58,6 +62,7 @@ class SourceConfig:
     priority: str = PRIORITY_NORMAL
     schedule_s: int = DEFAULT_SCHEDULE_S
     track_fields: list[str] | None = None
+    title_fields: list[str] | None = None  # record title (D17); None = the collector's default
     highlight: list[HighlightRule] = field(default_factory=list)
     options: dict[str, Any] = field(default_factory=dict)  # remaining type-specific keys
 
@@ -144,6 +149,21 @@ def _parse_source(index: int, raw: Any, seen_ids: set[str]) -> SourceConfig:
             raise _err(where, "track_fields", "must be a non-empty list of field names")
         track_fields = list(tf)
 
+    title_fields: list[str] | None = None
+    if raw.get("title_fields") is not None:
+        tt = raw["title_fields"]
+        if (
+            not isinstance(tt, list)
+            or not 1 <= len(tt) <= MAX_TITLE_FIELDS
+            or not all(isinstance(x, str) and x for x in tt)
+        ):
+            raise _err(
+                where,
+                "title_fields",
+                f"must be a list of 1-{MAX_TITLE_FIELDS} field names (non-empty strings)",
+            )
+        title_fields = list(tt)
+
     highlight: list[HighlightRule] = []
     if raw.get("highlight") is not None:
         highlight = _parse_highlight(where, raw["highlight"])
@@ -155,6 +175,7 @@ def _parse_source(index: int, raw: Any, seen_ids: set[str]) -> SourceConfig:
         priority=priority,
         schedule_s=schedule_s,
         track_fields=track_fields,
+        title_fields=title_fields,
         highlight=highlight,
         options=options,
     )

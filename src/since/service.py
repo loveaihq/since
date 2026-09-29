@@ -37,8 +37,8 @@ from since.render import (
     change_text,
     event_body,
     evt_handle,
-    label,
     rec_handle,
+    record_label,
 )
 from since.sanitize import DIGEST_CAP, GET_CAP, q
 from since.store import SourceState, Store
@@ -166,7 +166,7 @@ def _event_lines(event: Event, key_label: str) -> list[str]:
         lines: list[str] = []
         if event.record_key is not None:
             suffix = " (removed)" if kind == KIND_REMOVED else ""
-            record = label(key_label, event.record_key, GET_CAP)
+            record = record_label(event, key_label, GET_CAP)
             handle = rec_handle(event.source_id, event.record_key)
             lines.append(f"record: {record}{suffix}  {handle}")
         lines.extend(_change_line(change, kind) for change in event.field_changes)

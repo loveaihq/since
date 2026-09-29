@@ -31,7 +31,7 @@ from since.model import (
     FieldChange,
     Record,
 )
-from since.sources import CollectError, CollectOutput, get_collector
+from since.sources import CollectError, CollectOutput, get_collector, title_fields_for
 from since.store import Store
 from since.timeutil import to_iso
 
@@ -74,11 +74,23 @@ class FakeCollector:
         return outcome
 
 
+class TitledFake(FakeCollector):
+    """A fake that also defines the optional ``default_title_fields`` (like imap)."""
+
+    def __init__(self, defaults: list[str]) -> None:
+        super().__init__()
+        self.defaults = defaults
+
+    def default_title_fields(self, cfg: SourceConfig) -> list[str]:
+        return list(self.defaults)
+
+
 def make_cfg(
     source_id: str = "src",
     *,
     priority: str = "normal",
     track_fields: list[str] | None = None,
+    title_fields: list[str] | None = None,
     highlight: list[HighlightRule] | None = None,
     type: str = "dir",
 ) -> SourceConfig:
@@ -88,6 +100,7 @@ def make_cfg(
         priority=priority,
         schedule_s=900,
         track_fields=track_fields,
+        title_fields=title_fields,
         highlight=highlight or [],
     )
 
@@ -1213,3 +1226,175 @@ def test_failed_run_leaves_every_record_present(store: Store, fake: FakeCollecto
     assert after[3] == before[3] and after[4] == before[4]  # snapshot + record rows untouched
     assert len(store.get_snapshot("src")) == 20
     assert [e.kind for e in store.events_after(0)] == [KIND_BASELINE, KIND_SOURCE_ERROR]
+
+
+# -- record titles (D17) -------------------------------------------------------------------------
+
+
+def test_title_fields_for_prefers_config_then_collector_default_then_nothing() -> None:
+    titled = TitledFake(["subject", "from"])
+    assert title_fields_for(make_cfg(), titled) == ["subject", "from"]
+    assert title_fields_for(make_cfg(title_fields=["name"]), titled) == ["name"]
+    # the collector has no default_title_fields at all
+    assert title_fields_for(make_cfg(), FakeCollector()) == []
+    assert title_fields_for(make_cfg(title_fields=["name"]), FakeCollector()) == ["name"]
+    # the returned list is a copy: callers cannot change the config through it
+    cfg = make_cfg(title_fields=["name"])
+    title_fields_for(cfg, titled).append("x")
+    assert cfg.title_fields == ["name"]
+
+
+def test_builtin_collectors_have_no_default_title_fields() -> None:
+    for type_name in ("dir", "sql"):
+        assert title_fields_for(make_cfg(type=type_name), get_collector(type_name)) == []
+
+
+def test_added_event_stores_the_title_in_title_field_order(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(title_fields=["from", "subject"])
+    run(store, cfg, fake, [rec("m0", subject="old", **{"from": "x"})], 0)
+
+    new = rec("m1", subject="Hi", size=3, **{"from": "a"})
+    run(store, cfg, fake, [rec("m0", subject="old", **{"from": "x"}), new], 5)
+
+    (added,) = store.events_after(0)[1:]
+    assert (added.kind, added.record_key) == (KIND_ADDED, "m1")
+    assert added.detail == {"title": [["from", "a"], ["subject", "Hi"]]}  # config order
+
+
+def test_modified_event_stores_the_new_fields_as_title(store: Store, fake: FakeCollector) -> None:
+    cfg = make_cfg(title_fields=["subject", "from"])
+    run(store, cfg, fake, [rec("m", subject="Draft", seen=False, **{"from": "a"})], 0)
+
+    run(store, cfg, fake, [rec("m", subject="Final", seen=True, **{"from": "a"})], 5)
+
+    (modified,) = store.events_after(0)[1:]
+    assert modified.kind == KIND_MODIFIED
+    assert modified.detail == {"title": [["subject", "Final"], ["from", "a"]]}
+
+
+def test_title_comes_from_the_record_not_from_track_fields(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(track_fields=["seen"], title_fields=["subject"])
+    run(store, cfg, fake, [rec("m", subject="Hi", seen=False)], 0)
+
+    run(store, cfg, fake, [rec("m", subject="Hi", seen=True), rec("n", subject="New")], 5)
+
+    modified, added = store.events_after(0)[1:]
+    assert modified.field_changes == [FieldChange("seen", False, True)]
+    assert modified.detail == {"title": [["subject", "Hi"]]}
+    assert added.detail == {"title": [["subject", "New"]]}
+
+
+def test_removed_event_stores_the_last_known_fields_as_title(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(title_fields=["subject", "from"])
+    run(store, cfg, fake, [rec("m", subject="First", **{"from": "a"})], 0)
+    run(store, cfg, fake, [rec("m", subject="Last known", **{"from": "b"})], 5)
+
+    run(store, cfg, fake, [], 10)  # the mail is gone: nothing new to take a title from
+
+    removed = store.events_after(0)[-1]
+    assert (removed.kind, removed.record_key) == (KIND_REMOVED, "m")
+    assert removed.detail == {"title": [["subject", "Last known"], ["from", "b"]]}
+
+
+def test_a_title_field_missing_from_the_record_is_skipped(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(title_fields=["subject", "from", "sender"])
+    run(store, cfg, fake, [rec("gone", **{"from": "g"})], 0)
+
+    run(store, cfg, fake, [rec("added", subject="Hi", other=1)], 5)  # no "from", no "sender"
+
+    added, removed = store.events_after(0)[1:]
+    assert (added.kind, added.detail) == (KIND_ADDED, {"title": [["subject", "Hi"]]})
+    assert (removed.kind, removed.detail) == (KIND_REMOVED, {"title": [["from", "g"]]})
+
+
+def test_a_present_but_empty_or_null_title_value_is_kept(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(title_fields=["subject", "from"])
+    run(store, cfg, fake, [], 0)
+
+    run(store, cfg, fake, [rec("m", subject="", **{"from": None})], 5)
+
+    (added,) = store.events_after(0)[1:]
+    assert added.detail == {"title": [["subject", ""], ["from", None]]}
+
+
+def test_no_title_fields_keeps_the_detail_empty_for_every_record_kind(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg()
+    run(store, cfg, fake, [rec("a-mod", v=1), rec("b-gone", v=1)], 0)
+
+    run(store, cfg, fake, [rec("a-mod", v=2), rec("c-new", v=1)], 5)
+
+    events = store.events_after(0)
+    assert [(e.kind, e.detail) for e in events] == [
+        (KIND_BASELINE, {"record_count": 2}),
+        (KIND_MODIFIED, {}),
+        (KIND_REMOVED, {}),
+        (KIND_ADDED, {}),
+    ]
+
+
+def test_title_fields_that_no_record_has_keep_the_detail_empty(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(title_fields=["subject"])
+    run(store, cfg, fake, [rec("a-mod", v=1), rec("b-gone", v=1)], 0)
+
+    run(store, cfg, fake, [rec("a-mod", v=2), rec("c-new", v=1)], 5)
+
+    assert [e.detail for e in store.events_after(0)[1:]] == [{}, {}, {}]
+
+
+def test_collector_default_title_fields_are_used_when_config_has_none(store: Store) -> None:
+    fake = TitledFake(["subject"])
+    cfg = make_cfg()
+    run(store, cfg, fake, [], 0)
+
+    run(store, cfg, fake, [rec("m", subject="Hi", sender="a")], 5)
+
+    assert store.events_after(0)[1].detail == {"title": [["subject", "Hi"]]}
+
+
+def test_configured_title_fields_replace_the_collector_default(store: Store) -> None:
+    fake = TitledFake(["subject"])
+    cfg = make_cfg(title_fields=["sender"])
+    run(store, cfg, fake, [], 0)
+
+    run(store, cfg, fake, [rec("m", subject="Hi", sender="a")], 5)
+
+    assert store.events_after(0)[1].detail == {"title": [["sender", "a"]]}
+
+
+def test_baseline_and_source_level_events_never_carry_a_title(
+    store: Store, fake: FakeCollector
+) -> None:
+    cfg = make_cfg(title_fields=["subject"])
+    run(store, cfg, fake, [rec("m", subject="Hi")], 0)
+    run(store, cfg, fake, CollectError("down"), 5)
+    run(store, cfg, fake, [rec("m", subject="Hi")], 10)
+
+    details = {e.kind: e.detail for e in store.events_after(0)}
+    assert details[KIND_BASELINE] == {"record_count": 1}
+    assert "title" not in details[KIND_SOURCE_ERROR]
+    assert "title" not in details[KIND_SOURCE_RECOVERED]
+
+
+def test_a_failing_default_title_fields_is_a_source_failure(store: Store) -> None:
+    class Broken(TitledFake):
+        def default_title_fields(self, cfg: SourceConfig) -> list[str]:
+            raise RuntimeError("no title for you")
+
+    result = run(store, make_cfg(), Broken([]), [rec("m", v=1)], 0)
+
+    assert result.error == "RuntimeError: no title for you"
+    assert [e.kind for e in store.events_after(0)] == [KIND_SOURCE_ERROR]

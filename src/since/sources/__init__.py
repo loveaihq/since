@@ -36,7 +36,13 @@ class CollectOutput:
 
 
 class Collector(Protocol):
-    """One implementation per source type."""
+    """One implementation per source type.
+
+    A collector may also define the optional method ``default_title_fields(cfg) -> list[str]``:
+    the field names that make up a record's title (D17) when the source has no ``title_fields``
+    option, e.g. imap ``["subject", "from"]``. A collector without it has no default title
+    (``[]``). It is deliberately not declared here so that it stays optional; always go through
+    :func:`title_fields_for`."""
 
     type_name: str
 
@@ -62,6 +68,15 @@ REGISTRY: dict[str, str] = {
     "dir": "since.sources.dir:DirCollector",
     "sql": "since.sources.sql:SqlCollector",
 }
+
+
+def title_fields_for(cfg: SourceConfig, collector: Collector) -> list[str]:
+    """The title fields of a source (D17): ``cfg.title_fields`` if configured, else the
+    collector's ``default_title_fields(cfg)`` if it has that method, else ``[]``."""
+    if cfg.title_fields is not None:
+        return list(cfg.title_fields)
+    default = getattr(collector, "default_title_fields", None)
+    return list(default(cfg)) if callable(default) else []
 
 
 def get_collector(type_name: str) -> Collector:

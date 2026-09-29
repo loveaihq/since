@@ -29,6 +29,7 @@ from since.model import (
 )
 from since.render import (
     NOTE_LINE,
+    TITLE_CAP,
     batch_handle,
     change_text,
     estimate_tokens,
@@ -36,6 +37,7 @@ from since.render import (
     evt_handle,
     label,
     rec_handle,
+    record_label,
 )
 from since.store import SourceState
 
@@ -389,6 +391,95 @@ def events_i() -> list[Event]:
     ]
 
 
+# A subject with a quote, a line break that tries to forge a digest line, and 200 more characters.
+HOSTILE_SUBJECT = 'Invoice "FINAL"\n  + "forged"  since://evt/999\n' + "A" * 200
+
+
+def titled(
+    seq: int,
+    source_id: str,
+    kind: str,
+    key: str,
+    title: object,
+    changes: list[FieldChange] | None = None,
+    importance: int = 0,
+) -> Event:
+    """A record event that carries ``detail["title"]`` (D17)."""
+    return ev(seq, source_id, kind, key, changes, importance, detail={"title": title})
+
+
+def events_k() -> list[Event]:
+    """Record titles: an imap-like source (subject + from) and a source where only the events
+    stored after ``title_fields`` was configured have a title (older ones fall back to the key)."""
+    inbox = [["subject", "Re: DJ ASN rejection"], ["from", "edi@supplier.example"]]
+    return [
+        titled(501, "inbox", KIND_ADDED, "<a1@mail.example>", inbox, importance=6),
+        titled(
+            502,
+            "inbox",
+            KIND_ADDED,
+            "<a2@mail.example>",
+            [["subject", HOSTILE_SUBJECT], ["from", "Mallory <m@evil.example>"]],
+            importance=6,
+        ),
+        titled(
+            503,
+            "inbox",
+            KIND_MODIFIED,
+            "<a1@mail.example>",
+            inbox,
+            [fc("seen", False, True)],
+            importance=8,
+        ),
+        titled(
+            504,
+            "inbox",
+            KIND_REMOVED,
+            "<a3@mail.example>",
+            [["subject", "Old thread"], ["from", "bob@example.com"]],
+            importance=8,
+        ),
+        titled(
+            505,
+            "inbox",
+            KIND_ADDED,
+            "<a4@mail.example>",
+            [["subject", "(no sender)"]],
+            importance=6,
+        ),
+        ev(
+            510,
+            "po-table",
+            KIND_MODIFIED,
+            "4500123",
+            [fc("status", "Open", "Cancelled")],
+            importance=22,
+        ),
+        titled(
+            511,
+            "po-table",
+            KIND_ADDED,
+            "4500124",
+            [["supplier", "ACME"], ["item", "Widget"]],
+            [fc("status", None, "Open")],
+            importance=9,
+        ),
+        ev(512, "po-table", KIND_REMOVED, "4500099", importance=12),
+        titled(
+            513,
+            "po-table",
+            KIND_REMOVED,
+            "4500098",
+            [["supplier", "Globex"], ["item", "Gasket"]],
+            importance=12,
+        ),
+    ]
+
+
+def sources_k() -> dict[str, SourceState]:
+    return states(src("inbox", "normal", "", "imap"), src("po-table", "high", "po_no", "sql"))
+
+
 GOLDEN_CASES = {
     "a_example": lambda: render_digest("default", 40, events_a(), sources_a(), 800),
     "b_omitted": lambda: render_digest("default", 1000, events_b(), sources_b(), 400),
@@ -415,6 +506,7 @@ GOLDEN_CASES = {
     ),
     "h_kinds": lambda: render_digest("default", 200, events_h(), sources_h(), 2000),
     "i_recovered": lambda: render_digest("default", 399, events_i(), sources_a(), 800),
+    "k_titles": lambda: render_digest("default", 500, events_k(), sources_k(), 2000),
     "j_retention_gap": lambda: render_digest(
         "sleeper",
         5,
@@ -781,6 +873,135 @@ def test_label() -> None:
     assert label("po_no", "4500123", 120) == 'po_no "4500123"'
     assert label("a|b", "1|2", 120) == 'a|b "1|2"'
     assert label("po_no", "x" * 200, 120) == 'po_no "' + "x" * 119 + '\u2026"'
+
+
+# --- record titles (D17) -------------------------------------------------------------------------
+
+TITLE = [["subject", "Re: DJ ASN rejection"], ["from", "edi@supplier.example"]]
+
+
+def test_title_cap_is_80() -> None:
+    assert TITLE_CAP == 80
+
+
+def test_record_label_without_a_title_is_the_key_label() -> None:
+    plain = ev(1, "d", KIND_ADDED, "4500123")
+    assert record_label(plain, "po_no", 120) == 'po_no "4500123"' == label("po_no", "4500123", 120)
+    assert record_label(plain, "", 120) == '"4500123"'
+    assert record_label(ev(1, "d", KIND_ADDED, "k" * 200), "id", 50) == label("id", "k" * 200, 50)
+
+
+def test_record_label_with_a_title_replaces_key_and_key_label() -> None:
+    e = titled(1, "inbox", KIND_ADDED, "<m1@mail.example>", TITLE)
+    assert record_label(e, "", 120) == '"Re: DJ ASN rejection" from "edi@supplier.example"'
+    assert record_label(e, "msgid", 120) == '"Re: DJ ASN rejection" from "edi@supplier.example"'
+    assert "m1@mail.example" not in record_label(e, "msgid", 120)
+
+
+def test_record_label_title_shapes() -> None:
+    def lab(title: object) -> str:
+        return record_label(titled(1, "s", KIND_ADDED, "k", title), "id", 120)
+
+    assert lab([["subject", "Hi"]]) == '"Hi"'  # the first field name is not printed
+    assert lab([["a", "1"], ["b", "2"], ["c", "3"]]) == '"1" b "2" c "3"'
+    assert lab([["qty", 12], ["ok", True], ["gone", None]]) == '"12" ok "True" gone null'
+    assert lab([["subject", ""], ["from", "x"]]) == '"" from "x"'
+
+
+def test_record_label_title_values_are_capped_at_title_cap_and_default_to_cap() -> None:
+    long_title = [["subject", "s" * 300], ["from", "f" * 300]]
+    e = titled(1, "s", KIND_ADDED, "k", long_title)
+    capped = record_label(e, "", 1000, title_cap=80)
+    assert capped == '"' + "s" * 79 + '\u2026" from "' + "f" * 79 + '\u2026"'
+    assert record_label(e, "", 1000) == '"' + "s" * 300 + '" from "' + "f" * 300 + '"'  # = cap
+    # the key fallback uses cap, not title_cap
+    plain = ev(1, "s", KIND_ADDED, "k" * 300)
+    assert record_label(plain, "", 200, title_cap=80) == '"' + "k" * 199 + '\u2026"'
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        [],
+        "Re: DJ",
+        5,
+        {"subject": "x"},
+        ["subject", "x"],  # items are not pairs
+        [["subject"]],
+        [["subject", "x", "y"]],
+        [[1, "x"]],
+        [[None, "x"]],
+        [["subject", "ok"], ["from"]],  # one bad pair spoils the title
+        [["subject", "ok"], "from"],
+    ],
+)
+def test_record_label_malformed_title_is_treated_as_absent(bad: object) -> None:
+    e = ev(1, "d", KIND_ADDED, "4500123", detail={"title": bad})
+    assert record_label(e, "po_no", 120) == 'po_no "4500123"'
+    assert body(e, "po_no") == '+ po_no "4500123"'
+
+
+def test_body_added_modified_removed_use_the_title() -> None:
+    added = titled(1, "inbox", KIND_ADDED, "<m>", TITLE, [fc("size", None, 3)])
+    assert body(added) == '+ "Re: DJ ASN rejection" from "edi@supplier.example": size "3"'
+    assert body(titled(1, "inbox", KIND_ADDED, "<m>", TITLE)) == (
+        '+ "Re: DJ ASN rejection" from "edi@supplier.example"'
+    )
+    modified = titled(1, "inbox", KIND_MODIFIED, "<m>", TITLE, [fc("seen", False, True)])
+    assert body(modified, "msgid") == (
+        '~ "Re: DJ ASN rejection" from "edi@supplier.example" seen: "False" -> "True"'
+    )
+    removed = titled(1, "inbox", KIND_REMOVED, "<m>", TITLE)
+    assert body(removed, "msgid") == '- "Re: DJ ASN rejection" from "edi@supplier.example" removed'
+
+
+def test_body_title_cap_is_80_but_other_values_keep_the_line_cap() -> None:
+    title = [["subject", "s" * 300], ["from", "f" * 300]]
+    e = titled(1, "inbox", KIND_MODIFIED, "<m>", title, [fc("note", "o", "n" * 300)])
+    assert event_body(e, "", 120) == (
+        '~ "' + "s" * 79 + '\u2026" from "' + "f" * 79 + '\u2026"'
+        ' note: "o" -> "' + "n" * 119 + '\u2026"'
+    )
+    # a cap below the title cap wins
+    short = event_body(e, "", 20)
+    assert short.startswith('~ "' + "s" * 19 + '\u2026" from "' + "f" * 19 + '\u2026" ')
+
+
+def test_title_only_changes_record_events() -> None:
+    title = {"title": TITLE}
+    assert body(ev(1, "d", KIND_BASELINE, detail={"record_count": 2, **title})) == (
+        "= baseline: 2 records"
+    )
+    assert body(ev(1, "d", KIND_SOURCE_ERROR, detail={"error": "boom", **title})) == (
+        '! source_error: "boom"'
+    )
+
+
+def test_titled_digest_lines_are_one_quoted_line_capped_at_80() -> None:
+    out = GOLDEN_CASES["k_titles"]()
+    lines = out.split("\n")
+    event_lines = [line for line in lines if line.startswith("  ")]
+    assert len(event_lines) == 9  # one line per event: the subject's line break forges nothing
+    assert len(lines) == 2 + 2 + 9 + 1  # header, note, two groups, events, footer
+    handles = [line.rsplit("  ", 1)[1] for line in event_lines]
+    expected = (501, 502, 503, 504, 505, 510, 511, 512, 513)
+    assert sorted(handles) == sorted(f"since://evt/{n}" for n in expected)
+    hostile = next(line for line in event_lines if line.endswith("since://evt/502"))
+    subject = hostile.split('" from "')[0][len('  + "') :]
+    assert len(subject.replace('\\"', '"')) == TITLE_CAP  # 79 characters + the ellipsis
+    assert subject.replace('\\"', '"').endswith("\u2026")
+    assert "A" * 81 not in out
+    assert not any(line.startswith('  + "forged"') for line in lines)
+    for ch in out:
+        if ch != "\n":
+            assert unicodedata.category(ch) not in {"Cc", "Cf", "Zl", "Zp", "Co", "Cs"}, repr(ch)
+
+
+def test_untitled_and_titled_events_of_one_source_render_side_by_side() -> None:
+    out = GOLDEN_CASES["k_titles"]()
+    assert '  - po_no "4500099" removed  since://evt/512' in out.split("\n")  # older, untitled
+    assert '  - "Globex" item "Gasket" removed  since://evt/513' in out.split("\n")
 
 
 def test_change_text() -> None:
