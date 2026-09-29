@@ -297,7 +297,7 @@ First run (2026-09-29, 3 runs per arm; mean, range in brackets):
 | Recall on items observable by Since (16) | 79% (75–81%) | **100%** (all runs) |
 | Recall on items A's tools can reach (13) | 97% (92–100%) | 100% |
 | Precision | 100% | 100% |
-| Input tokens incl. cache (median) | 31,285 (25,320–42,832; median 25,704) | 25,900 (25,822–26,042; median 25,837) |
+| Input tokens incl. cache: mean (range; median) | 31,285 (25,320–42,832; median 25,704) | 25,900 (25,822–26,042; median 25,837) |
 | Tool calls / model requests | 7 / 3.3 | 3 / 3 |
 | Cost | $0.078 | $0.075 |
 
@@ -306,7 +306,7 @@ What it shows, and what it doesn't:
   the login expired and the layout change: by the time it looks, the portal shows only a login page.
   Since had recorded them while the portal was readable. On what A could reach, both arms did well.
 - **Tokens and cost were about the same** in this small world: two of three A runs used slightly fewer
-  input tokens than B; one A run needed an extra model request and used 66% more. Since's runs were
+  input tokens than B; one A run needed an extra model request and used about 66% more than the other five runs. Since's runs were
   steadier. The simulated inbox is small (118 new mails) and the raw agent filtered the PO table by
   `updated_at`; larger or noisier sources were not measured yet.
 
