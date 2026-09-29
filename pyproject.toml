@@ -30,6 +30,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # the dev-only benchmark package `bench/` sits at the repo root
 
 [tool.ruff]
 line-length = 100
