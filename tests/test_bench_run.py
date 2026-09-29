@@ -14,7 +14,7 @@ import pytest
 
 import bench.run as run_mod
 from bench.grade import grade
-from bench.prompt import ARMS, TOOLS, build_prompt
+from bench.prompt import ARMS, TOOLS, build_prompt, system_prompt
 from bench.replay import Observation
 from bench.run import (
     ARM_SPECS,
@@ -920,3 +920,15 @@ def test_progress_lines_survive_any_console_encoding(capsys: pytest.CaptureFixtu
     run_mod._say("claude: C:/Users/Zoë/中文/claude.exe")
     out = capsys.readouterr().out
     assert out.isascii() and "claude.exe" in out
+
+
+def test_claude_command_pins_a_neutral_system_prompt_and_effort(tmp_path: Path) -> None:
+    # D35: the default Claude Code system prompt carries the real date, which would contradict the
+    # simulated "now"; both arms get the same neutral prompt and a fixed effort level
+    cmd = run_mod.claude_command("claude", tmp_path / "mcp.json", "A", "sonnet", 3)
+    assert cmd[cmd.index("--system-prompt") + 1] == system_prompt()
+    assert "2026-09-16 10:00 UTC" in system_prompt()
+    assert cmd[cmd.index("--effort") + 1] == "medium"
+    assert run_mod.claude_command("claude", tmp_path / "mcp.json", "B", "sonnet", 3)[
+        cmd.index("--system-prompt") + 1
+    ] == system_prompt()

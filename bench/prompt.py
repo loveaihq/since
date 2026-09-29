@@ -32,6 +32,15 @@ def _stamp(moment: datetime) -> str:
     return f"{moment:%Y-%m-%d %H:%M} UTC"
 
 
+def system_prompt() -> str:
+    """Neutral system prompt for both arms: replaces Claude Code's default one, whose real date
+    ("Today's date is ...") would contradict the simulated now (D35)."""
+    return (
+        "You are a careful assistant. Use only the tools you are given. "
+        f"The current date and time is {_stamp(NOW)}."
+    )
+
+
 def _shared(tools: str) -> str:
     return f"""You are an operations assistant for a wholesale supplier. It is now {_stamp(NOW)}. \
 You last looked at the business at {_stamp(LAST_LOOK)}.

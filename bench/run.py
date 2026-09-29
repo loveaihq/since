@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from bench.grade import Item, extract_items, grade, normalise
-from bench.prompt import ARMS, build_prompt
+from bench.prompt import ARMS, build_prompt, system_prompt
 from bench.replay import (
     MIN_SCHEDULE_S,
     Observation,
@@ -201,6 +201,10 @@ def claude_command(
         ARM_SPECS[arm].allowed_tools,
         "--setting-sources",
         "",
+        "--system-prompt",
+        system_prompt(),
+        "--effort",
+        "medium",
         "--model",
         model,
         "--max-budget-usd",
