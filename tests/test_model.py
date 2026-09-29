@@ -214,26 +214,7 @@ def test_parse_schedule_rejects(text):
         parse_schedule(text)
 
 
-# --- cli skeleton ----------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["daemon"],
-        ["daemon", "--once"],
-        ["mcp"],
-        ["collect", "po-table"],
-        ["digest"],
-        ["digest", "--agent", "a", "--budget", "300", "--source", "docs"],
-        ["get", "since://evt/1", "--budget", "500", "--agent", "a"],
-        ["ack", "5", "--agent", "a"],
-        ["status"],
-    ],
-)
-def test_cli_subcommands_are_stubs(argv, capsys):
-    assert cli.main(argv) == 2
-    assert "not implemented" in capsys.readouterr().err
+# --- cli parser (the subcommands themselves are tested in test_cli.py) -----------------------
 
 
 def test_cli_requires_a_subcommand():
