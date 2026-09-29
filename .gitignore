@@ -15,3 +15,6 @@ dist/
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# benchmark: replayed homes (DB + browser profile) stay local
+bench/results/*/since-home/
