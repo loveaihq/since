@@ -140,6 +140,7 @@ _BOOL_COLUMNS = frozenset({"configured", "baselined", "in_error"})
 _EVENT_COLUMNS = (
     "seq, source_id, kind, record_key, field_changes_json, importance, detail_json, created_at"
 )
+_SERVED_COLUMNS = "id, agent_id, tool, args_json, text, via, at"
 
 
 class StoreError(Exception):
@@ -185,6 +186,18 @@ class ServedEntry:
     at: str
 
 
+@dataclass(frozen=True)
+class AgentSummary:
+    """What the database knows about one agent id: its cursor (0 if it never acked; the id is
+    known from the served log then), when the cursor last moved, and its served-log totals."""
+
+    agent_id: str
+    cursor: int
+    cursor_updated_at: str | None
+    served_count: int
+    last_served_at: str | None
+
+
 class PruneResult(NamedTuple):
     """Rows deleted by :meth:`Store.prune`."""
 
@@ -228,6 +241,18 @@ def _event_from_row(row: sqlite3.Row) -> Event:
         importance=row["importance"],
         detail=json.loads(row["detail_json"]),
         created_at=row["created_at"],
+    )
+
+
+def _served_from_row(row: sqlite3.Row) -> ServedEntry:
+    return ServedEntry(
+        id=row["id"],
+        agent_id=row["agent_id"],
+        tool=row["tool"],
+        args=json.loads(row["args_json"]),
+        text=row["text"],
+        via=row["via"],
+        at=row["at"],
     )
 
 
@@ -560,6 +585,25 @@ class Store:
         rows = self._conn.execute(sql + " ORDER BY seq", params).fetchall()
         return [_event_from_row(r) for r in rows]
 
+    def list_events(
+        self, before: int | None = None, source_id: str | None = None, limit: int = 50
+    ) -> list[Event]:
+        """Newest first (seq descending): events with ``seq < before`` (if given), optionally one
+        source, at most ``limit``. Read-only, for the audit page."""
+        sql = f"SELECT {_EVENT_COLUMNS} FROM events"
+        where: list[str] = []
+        params: list[Any] = []
+        if before is not None:
+            where.append("seq < ?")
+            params.append(before)
+        if source_id is not None:
+            where.append("source_id = ?")
+            params.append(source_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        rows = self._conn.execute(sql + " ORDER BY seq DESC LIMIT ?", (*params, limit)).fetchall()
+        return [_event_from_row(r) for r in rows]
+
     def max_seq(self) -> int:
         """Highest seq ever assigned (0 if none). Read from ``sqlite_sequence`` so it survives
         pruning of every event."""
@@ -605,25 +649,51 @@ class Store:
         assert row_id is not None
         return row_id
 
-    def list_served(self, agent_id: str | None = None, limit: int = 50) -> list[ServedEntry]:
-        """Newest first (id descending), optionally for one agent, at most ``limit`` rows."""
-        sql = "SELECT id, agent_id, tool, args_json, text, via, at FROM served_log"
+    def list_served(
+        self, agent_id: str | None = None, limit: int = 50, before: int | None = None
+    ) -> list[ServedEntry]:
+        """Newest first (id descending), optionally for one agent and only rows with
+        ``id < before``, at most ``limit`` rows."""
+        sql = f"SELECT {_SERVED_COLUMNS} FROM served_log"
+        where: list[str] = []
         params: list[Any] = []
         if agent_id is not None:
-            sql += " WHERE agent_id = ?"
+            where.append("agent_id = ?")
             params.append(agent_id)
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
+        if before is not None:
+            where.append("id < ?")
+            params.append(before)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        rows = self._conn.execute(sql + " ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
+        return [_served_from_row(r) for r in rows]
+
+    def get_served(self, served_id: int) -> ServedEntry | None:
+        """One served-log row by id, or None (never existed or pruned)."""
+        row = self._conn.execute(
+            f"SELECT {_SERVED_COLUMNS} FROM served_log WHERE id = ?", (served_id,)
+        ).fetchone()
+        return None if row is None else _served_from_row(row)
+
+    def list_agents(self) -> list[AgentSummary]:
+        """Every agent id that has a cursor or a served-log row, ordered by agent id. An agent
+        without a cursor row has cursor 0 (as :meth:`get_cursor` says)."""
+        rows = self._conn.execute(
+            "SELECT a.agent_id AS agent_id, c.seq AS cursor_seq, c.updated_at AS cursor_at, "
+            "COALESCE(s.n, 0) AS served_count, s.last_at AS last_served_at "
+            "FROM (SELECT agent_id FROM cursors UNION SELECT agent_id FROM served_log) AS a "
+            "LEFT JOIN cursors AS c ON c.agent_id = a.agent_id "
+            "LEFT JOIN (SELECT agent_id, COUNT(*) AS n, MAX(at) AS last_at FROM served_log "
+            "GROUP BY agent_id) AS s ON s.agent_id = a.agent_id "
+            "ORDER BY a.agent_id"
+        ).fetchall()
         return [
-            ServedEntry(
-                id=r["id"],
+            AgentSummary(
                 agent_id=r["agent_id"],
-                tool=r["tool"],
-                args=json.loads(r["args_json"]),
-                text=r["text"],
-                via=r["via"],
-                at=r["at"],
+                cursor=0 if r["cursor_seq"] is None else int(r["cursor_seq"]),
+                cursor_updated_at=r["cursor_at"],
+                served_count=int(r["served_count"]),
+                last_served_at=r["last_served_at"],
             )
             for r in rows
         ]

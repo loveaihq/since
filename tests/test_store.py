@@ -23,7 +23,7 @@ from since.model import (
     FieldChange,
     Record,
 )
-from since.store import SourceState, Store, StoreError
+from since.store import AgentSummary, SourceState, Store, StoreError
 
 T0 = datetime(2026, 9, 29, 9, 0, 0, tzinfo=UTC)
 
@@ -722,6 +722,20 @@ def test_events_in_range(store: Store) -> None:
     assert store.events_in_range(1, 5, after=5) == []
 
 
+def test_list_events_is_newest_first_with_before_and_source(store: Store) -> None:
+    _seed_events(store)
+    assert [e.seq for e in store.list_events()] == [5, 4, 3, 2, 1]
+    assert [e.seq for e in store.list_events(limit=2)] == [5, 4]
+    assert [e.seq for e in store.list_events(before=4)] == [3, 2, 1]  # strictly before
+    assert [e.seq for e in store.list_events(before=4, limit=1)] == [3]
+    assert [e.seq for e in store.list_events(source_id="a")] == [5, 3, 1]
+    assert [e.seq for e in store.list_events(before=5, source_id="a", limit=1)] == [3]
+    assert store.list_events(before=1) == []
+    assert store.list_events(source_id="zzz") == []
+    newest = store.list_events(limit=1)[0]
+    assert newest == store.get_event(5)  # full events, like get_event
+
+
 def test_max_seq_empty_is_zero(store: Store) -> None:
     assert store.max_seq() == 0
 
@@ -763,6 +777,49 @@ def test_served_log_roundtrip_and_filters(store: Store) -> None:
     assert [e.id for e in store.list_served("a1")] == [3, 1]
     assert [e.id for e in store.list_served(limit=2)] == [3, 2]
     assert store.list_served("nobody") == []
+
+
+def test_list_served_before_pages_backwards_per_agent(store: Store) -> None:
+    for i in range(1, 7):
+        store.log_served("a1" if i % 2 else "a2", "since", {"i": i}, f"t{i}", "mcp", at(i))
+    assert [e.id for e in store.list_served(limit=2)] == [6, 5]
+    assert [e.id for e in store.list_served(limit=2, before=5)] == [4, 3]
+    assert [e.id for e in store.list_served(before=3)] == [2, 1]
+    assert [e.id for e in store.list_served("a1", before=5)] == [3, 1]  # 1, 3, 5 are a1's
+    assert [e.id for e in store.list_served("a1", limit=1, before=6)] == [5]
+    assert store.list_served(before=1) == []
+
+
+def test_get_served_by_id(store: Store) -> None:
+    served_id = store.log_served("a1", "get", {"handle": "since://evt/1"}, "the text", "cli", at(4))
+    entry = store.get_served(served_id)
+    assert entry is not None
+    assert (entry.id, entry.agent_id, entry.tool, entry.args) == (
+        served_id,
+        "a1",
+        "get",
+        {"handle": "since://evt/1"},
+    )
+    assert (entry.text, entry.via, entry.at) == ("the text", "cli", "2026-09-29T09:04:00Z")
+    assert entry == store.list_served()[0]
+    assert store.get_served(served_id + 1) is None
+    assert store.get_served(0) is None
+
+
+def test_list_agents_merges_cursors_and_served_log(store: Store) -> None:
+    assert store.list_agents() == []
+    store.set_cursor("only-cursor", 4, at(1))
+    store.log_served("only-served", "since", {}, "x", "mcp", at(2))
+    store.log_served("both", "since", {}, "x", "mcp", at(3))
+    store.log_served("both", "get", {}, "y", "cli", at(5))
+    store.log_served("both", "get", {}, "z", "cli", at(4))
+    store.set_cursor("both", 9, at(6))
+    assert store.list_agents() == [
+        AgentSummary("both", 9, "2026-09-29T09:06:00Z", 3, "2026-09-29T09:05:00Z"),
+        AgentSummary("only-cursor", 4, "2026-09-29T09:01:00Z", 0, None),
+        AgentSummary("only-served", 0, None, 1, "2026-09-29T09:02:00Z"),  # cursor as get_cursor
+    ]
+    assert store.get_cursor("only-served") == 0
 
 
 def test_served_log_keeps_full_text(store: Store) -> None:

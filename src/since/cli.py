@@ -1,4 +1,4 @@
-"""Command-line entry point: ``since daemon|mcp|collect|login|digest|get|ack|status``.
+"""Command-line entry point: ``since daemon|mcp|collect|login|digest|get|ack|status|ui``.
 
 ``digest`` / ``get`` / ``ack`` / ``status`` read only the database (no config file needed) and
 print exactly what the MCP tools return. Exit codes: 0 ok; 1 collection failure, service error
@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
+from since import ui
 from since.collect import register_sources, run_collection
 from since.config import Config, ConfigError, SourceConfig, load_config
 from since.daemon import Daemon, DaemonError
@@ -57,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", default="default")
 
     sub.add_parser("status", help="show source and daemon status")
+
+    p = sub.add_parser("ui", help="serve the read-only audit page on localhost")
+    p.add_argument("--port", type=int, default=ui.DEFAULT_PORT, help="0 picks a free port")
     return parser
 
 
@@ -192,6 +196,16 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return _serve(lambda s: s.status())
 
 
+def _cmd_ui(args: argparse.Namespace) -> int:
+    """D32: the read-only audit page; needs no config file, runs until Ctrl-C."""
+    if not 0 <= args.port <= 65535:
+        return _fail("--port must be between 0 and 65535", 2)
+    try:
+        return ui.serve(args.port)
+    except ui.UiError as exc:
+        return _fail(str(exc), 1)
+
+
 _COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "daemon": _cmd_daemon,
     "mcp": _cmd_mcp,
@@ -201,6 +215,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "get": _cmd_get,
     "ack": _cmd_ack,
     "status": _cmd_status,
+    "ui": _cmd_ui,
 }
 
 
