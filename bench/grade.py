@@ -11,8 +11,10 @@ block gives no items and ``malformed=True``. ``normalise`` makes references comp
 - duplicates count once; an item whose kind is not one of ``email | po | portal | system`` (or that
   could not be read as an object with ``kind`` and ``ref``) is a false positive;
 - ``recall`` = planted found / planted; ``recall_observable`` = the same over the planted items
-  that Since can observe at all (the replay says which); ``precision`` = correct reported /
-  reported. With nothing reported, precision is 0.0: nothing correct was delivered.
+  that Since can observe at all (the replay says which); ``recall_observable_a`` = the same over
+  the planted items that arm A's raw tools can reach (``arm_a_observable``); ``precision`` =
+  correct reported / reported. With nothing reported, precision is 0.0: nothing correct was
+  delivered.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
+
+from bench.world import KIND_PORTAL, KIND_SYSTEM, NOW, SYSTEM_LAYOUT, World
 
 KINDS = ("email", "po", "portal", "system")
 UNREADABLE_KIND = (
@@ -111,6 +115,7 @@ class Grade:
 
     recall: float
     recall_observable: float
+    recall_observable_a: float
     precision: float
     tp: list[Item] = field(default_factory=list)
     fp: list[Item] = field(default_factory=list)
@@ -122,6 +127,7 @@ class Grade:
         return {
             "recall": self.recall,
             "recall_observable": self.recall_observable,
+            "recall_observable_a": self.recall_observable_a,
             "precision": self.precision,
             "tp": [list(item) for item in self.tp],
             "fp": [list(item) for item in self.fp],
@@ -135,17 +141,65 @@ def _ratio(found: int, total: int, empty: float) -> float:
     return found / total if total else empty
 
 
-def grade(items: Iterable[Item], planted: Iterable[Item], observable: Iterable[Item]) -> Grade:
-    """Score ``items`` (as reported) against ``planted`` (the answer key) and ``observable`` (the
-    part of it Since can see). Everything is compared after ``normalise``."""
+# The same reasoning as in ``arm_a_observable``, for the report.
+ARM_A_LIMITS = (
+    "A cannot see any portal order change (the portal is behind a login at the simulated now, "
+    "and A's notes are from the last look) and cannot detect portal-layout (the changed page is "
+    "behind the login page too)"
+)
+
+
+def arm_a_observable(planted: Iterable[Item], *, portal_blind: bool = True) -> list[Item]:
+    """The planted items that arm A's raw tools can reach at all.
+
+    Arm A reads the mailbox and the PO database as they are now, and holds notes of the PO table
+    and the portal page from the last look. So it can find every mail item and (by diffing the
+    notes against the database) every PO item. The portal is different: ``fetch_portal()`` returns
+    the page as of now, and when the portal's login has expired by now (``portal_blind``) that page
+    is the login page. Then
+
+    - no portal order change is visible: the notes show the orders as of the last look, the page
+      shows none of them, and no other tool reaches the portal;
+    - ``portal-layout`` cannot be detected: the page that changed layout is behind the login page,
+      and the notes are from before the change;
+    - ``portal-login`` is visible: the login page is the evidence.
+
+    When the portal is readable at now (``portal_blind=False``) A sees the page, so every item is
+    reachable. Order is that of ``planted``."""
+    layout = (KIND_SYSTEM, SYSTEM_LAYOUT)
+    return [
+        (kind, ref)
+        for kind, ref in planted
+        if not (portal_blind and (kind == KIND_PORTAL or (kind, ref) == layout))
+    ]
+
+
+def arm_a_observable_in(world: World) -> list[Item]:
+    """``arm_a_observable`` of a world: A is blind to the portal exactly when the portal's login
+    has expired by ``NOW`` (the page A can fetch is then the login page)."""
+    blind = world.state_at(NOW).portal.login_expired
+    return arm_a_observable(world.planted, portal_blind=blind)
+
+
+def grade(
+    items: Iterable[Item],
+    planted: Iterable[Item],
+    observable: Iterable[Item],
+    observable_a: Iterable[Item],
+) -> Grade:
+    """Score ``items`` (as reported) against ``planted`` (the answer key), ``observable`` (the part
+    of it Since can see) and ``observable_a`` (the part arm A's tools can reach). Everything is
+    compared after ``normalise``."""
     key = {normalise(kind, ref): (kind, ref) for kind, ref in planted}
     seen_observable = {normalise(kind, ref) for kind, ref in observable} & key.keys()
+    seen_a = {normalise(kind, ref) for kind, ref in observable_a} & key.keys()
     normalised = [normalise(kind, ref) for kind, ref in items]
     reported = set(normalised)
     correct = reported & key.keys()
     return Grade(
         recall=_ratio(len(correct), len(key), 1.0),
         recall_observable=_ratio(len(correct & seen_observable), len(seen_observable), 1.0),
+        recall_observable_a=_ratio(len(correct & seen_a), len(seen_a), 1.0),
         precision=_ratio(len(correct), len(reported), 0.0),
         tp=[key[item] for item in sorted(correct)],
         fp=sorted(item for item in reported if item not in key),

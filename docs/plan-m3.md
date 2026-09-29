@@ -71,7 +71,7 @@ Same task prompt for both arms except the tool paragraph; it ends by requiring a
 `{"items": [{"kind": "...", "ref": "..."}]}`.
 From the stream: tool calls = `tool_use` blocks; input tokens = sum over assistant turns of
 `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` (also report the uncached part);
-output tokens; cost (`total_cost_usd`); turns; wall time.
+output tokens; cost (`total_cost_usd`); model requests (`api_calls`); wall time.
 Grading: normalise refs (strip, upper-case, digits for numeric refs); recall = planted found / planted;
 precision = correct reported / reported (duplicates counted once; unknown refs are false positives).
 Results: `bench/results/<UTC timestamp>/` (raw stream per run, `results.json`) and `bench/REPORT.md` (table:

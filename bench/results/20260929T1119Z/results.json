@@ -8,13 +8,13 @@
    "max_budget_usd": 3.0,
    "started": "2026-09-29T11:20:59Z",
    "command": [
-    "C:\\Users\\<user>\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
+    "~\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
     "-p",
     "--output-format",
     "stream-json",
     "--verbose",
     "--mcp-config",
-    "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-A1-4zbx212i\\mcp.json",
+    "~\\AppData\\Local\\Temp\\since-bench-A1-4zbx212i\\mcp.json",
     "--strict-mcp-config",
     "--tools",
     "",
@@ -62,6 +62,7 @@
     "cache_read_input_tokens": 27022,
     "output_tokens": 1783,
     "total_input_tokens": 42832,
+    "final_context_tokens": 15804,
     "cost_usd": 0.08645839999999999,
     "num_turns": 9,
     "api_calls": 4,
@@ -156,6 +157,7 @@
    "grade": {
     "recall": 0.7222222222222222,
     "recall_observable": 0.8125,
+    "recall_observable_a": 1.0,
     "precision": 1.0,
     "tp": [
      [
@@ -248,13 +250,13 @@
    "max_budget_usd": 3.0,
    "started": "2026-09-29T11:21:19Z",
    "command": [
-    "C:\\Users\\<user>\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
+    "~\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
     "-p",
     "--output-format",
     "stream-json",
     "--verbose",
     "--mcp-config",
-    "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-B1-cmeue94w\\mcp.json",
+    "~\\AppData\\Local\\Temp\\since-bench-B1-cmeue94w\\mcp.json",
     "--strict-mcp-config",
     "--tools",
     "",
@@ -283,7 +285,7 @@
        "mcp"
       ],
       "env": {
-       "SINCE_HOME": "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-B1-cmeue94w\\since-home"
+       "SINCE_HOME": "~\\AppData\\Local\\Temp\\since-bench-B1-cmeue94w\\since-home"
       }
      }
     }
@@ -301,6 +303,7 @@
     "cache_read_input_tokens": 10143,
     "output_tokens": 1267,
     "total_input_tokens": 25822,
+    "final_context_tokens": 15675,
     "cost_usd": 0.0774026,
     "num_turns": 4,
     "api_calls": 3,
@@ -404,6 +407,7 @@
    "grade": {
     "recall": 0.8888888888888888,
     "recall_observable": 1.0,
+    "recall_observable_a": 1.0,
     "precision": 1.0,
     "tp": [
      [
@@ -496,13 +500,13 @@
    "max_budget_usd": 3.0,
    "started": "2026-09-29T11:22:14Z",
    "command": [
-    "C:\\Users\\<user>\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
+    "~\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
     "-p",
     "--output-format",
     "stream-json",
     "--verbose",
     "--mcp-config",
-    "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-A2-2hgt7ctl\\mcp.json",
+    "~\\AppData\\Local\\Temp\\since-bench-A2-2hgt7ctl\\mcp.json",
     "--strict-mcp-config",
     "--tools",
     "",
@@ -550,6 +554,7 @@
     "cache_read_input_tokens": 10386,
     "output_tokens": 1801,
     "total_input_tokens": 25320,
+    "final_context_tokens": 16095,
     "cost_usd": 0.0798112,
     "num_turns": 8,
     "api_calls": 3,
@@ -643,6 +648,7 @@
    "grade": {
     "recall": 0.7222222222222222,
     "recall_observable": 0.8125,
+    "recall_observable_a": 1.0,
     "precision": 1.0,
     "tp": [
      [
@@ -735,13 +741,13 @@
    "max_budget_usd": 3.0,
    "started": "2026-09-29T11:22:36Z",
    "command": [
-    "C:\\Users\\<user>\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
+    "~\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
     "-p",
     "--output-format",
     "stream-json",
     "--verbose",
     "--mcp-config",
-    "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-B2-9a3skfcm\\mcp.json",
+    "~\\AppData\\Local\\Temp\\since-bench-B2-9a3skfcm\\mcp.json",
     "--strict-mcp-config",
     "--tools",
     "",
@@ -770,7 +776,7 @@
        "mcp"
       ],
       "env": {
-       "SINCE_HOME": "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-B2-9a3skfcm\\since-home"
+       "SINCE_HOME": "~\\AppData\\Local\\Temp\\since-bench-B2-9a3skfcm\\since-home"
       }
      }
     }
@@ -788,6 +794,7 @@
     "cache_read_input_tokens": 11289,
     "output_tokens": 1402,
     "total_input_tokens": 25837,
+    "final_context_tokens": 15683,
     "cost_usd": 0.0744578,
     "num_turns": 4,
     "api_calls": 3,
@@ -891,6 +898,7 @@
    "grade": {
     "recall": 0.8888888888888888,
     "recall_observable": 1.0,
+    "recall_observable_a": 1.0,
     "precision": 1.0,
     "tp": [
      [
@@ -983,13 +991,13 @@
    "max_budget_usd": 3.0,
    "started": "2026-09-29T11:22:52Z",
    "command": [
-    "C:\\Users\\<user>\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
+    "~\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
     "-p",
     "--output-format",
     "stream-json",
     "--verbose",
     "--mcp-config",
-    "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-A3-b5_i374i\\mcp.json",
+    "~\\AppData\\Local\\Temp\\since-bench-A3-b5_i374i\\mcp.json",
     "--strict-mcp-config",
     "--tools",
     "",
@@ -1037,6 +1045,7 @@
     "cache_read_input_tokens": 13308,
     "output_tokens": 1467,
     "total_input_tokens": 25704,
+    "final_context_tokens": 13557,
     "cost_usd": 0.06690360000000001,
     "num_turns": 7,
     "api_calls": 3,
@@ -1126,6 +1135,7 @@
    "grade": {
     "recall": 0.6666666666666666,
     "recall_observable": 0.75,
+    "recall_observable_a": 0.9230769230769231,
     "precision": 1.0,
     "tp": [
      [
@@ -1218,13 +1228,13 @@
    "max_budget_usd": 3.0,
    "started": "2026-09-29T11:23:09Z",
    "command": [
-    "C:\\Users\\<user>\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
+    "~\\AppData\\Roaming\\Claude\\claude-code\\2.1.284\\claude.exe",
     "-p",
     "--output-format",
     "stream-json",
     "--verbose",
     "--mcp-config",
-    "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-B3-jwgm6j5u\\mcp.json",
+    "~\\AppData\\Local\\Temp\\since-bench-B3-jwgm6j5u\\mcp.json",
     "--strict-mcp-config",
     "--tools",
     "",
@@ -1253,7 +1263,7 @@
        "mcp"
       ],
       "env": {
-       "SINCE_HOME": "C:\\Users\\<user>\\AppData\\Local\\Temp\\since-bench-B3-jwgm6j5u\\since-home"
+       "SINCE_HOME": "~\\AppData\\Local\\Temp\\since-bench-B3-jwgm6j5u\\since-home"
       }
      }
     }
@@ -1271,6 +1281,7 @@
     "cache_read_input_tokens": 11288,
     "output_tokens": 1326,
     "total_input_tokens": 26042,
+    "final_context_tokens": 15889,
     "cost_usd": 0.07452160000000001,
     "num_turns": 4,
     "api_calls": 3,
@@ -1374,6 +1385,7 @@
    "grade": {
     "recall": 0.8888888888888888,
     "recall_observable": 1.0,
+    "recall_observable_a": 1.0,
     "precision": 1.0,
     "tp": [
      [
@@ -1482,6 +1494,7 @@
     "supplier": 23
    },
    "mails_business": 54,
+   "mails_business_after_last_look": 23,
    "mail_flag_events": 144,
    "po_rows_at_start": 58,
    "po_rows_now": 64,
@@ -1784,6 +1797,60 @@
     "ref": "portal-password-reminder",
     "why": "a reminder about a password that expires in 30 days; the login still worked when it was sent"
    }
+  ],
+  "observable_a": [
+   [
+    "email",
+    "41000010"
+   ],
+   [
+    "email",
+    "5100019"
+   ],
+   [
+    "email",
+    "61000034"
+   ],
+   [
+    "email",
+    "61000037"
+   ],
+   [
+    "email",
+    "700033"
+   ],
+   [
+    "email",
+    "73000009"
+   ],
+   [
+    "email",
+    "91000019"
+   ],
+   [
+    "po",
+    "4500108"
+   ],
+   [
+    "po",
+    "4500111"
+   ],
+   [
+    "po",
+    "4500130"
+   ],
+   [
+    "po",
+    "4500153"
+   ],
+   [
+    "po",
+    "4500156"
+   ],
+   [
+    "system",
+    "portal-login"
+   ]
   ]
  },
  "updated": "2026-09-29T11:23:25Z"

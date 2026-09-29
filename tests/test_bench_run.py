@@ -4,6 +4,7 @@ M3 T4). No model calls: the CLI is faked by a small script that prints a recorde
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import textwrap
 import time
@@ -13,7 +14,7 @@ from typing import Any
 import pytest
 
 import bench.run as run_mod
-from bench.grade import grade
+from bench.grade import arm_a_observable_in, grade
 from bench.prompt import ARMS, TOOLS, build_prompt, system_prompt
 from bench.replay import Observation
 from bench.run import (
@@ -31,8 +32,12 @@ from bench.run import (
     mcp_config,
     parse_arms,
     parse_stream,
+    rebuild_report,
     render_report,
     run_process,
+    scrub_bytes,
+    scrub_file,
+    scrub_text,
     world_block,
     write_reports,
 )
@@ -352,12 +357,30 @@ def test_parse_normal_stream_counts_duplicates_once() -> None:
         2200,
     )
     assert m.output_tokens == 170 and m.total_input_tokens == 60 + 1200 + 2200
+    assert m.final_context_tokens == 30 + 0 + 1200  # the last request (m3) alone
     assert m.cost_usd == pytest.approx(0.1234) and m.duration_s == pytest.approx(4.321)
     assert (m.model, m.claude_version) == (MODEL, "2.1.284")
     assert m.mcp_servers == [{"name": "raw", "status": "connected"}]
     assert m.init_seen and m.bad_lines == 0
     assert parsed.final_text == ANSWER
     json.dumps(m.to_dict())
+
+
+def test_final_context_is_the_last_real_model_request() -> None:
+    lines = [
+        init_event(),
+        assistant("m1", tool_block("t1", "mcp__raw__x"), usage(10, 1000, 0, 5)),
+        tool_result("t1"),
+        assistant("m2", text_block("a"), usage(5, 200, 3000, 1)),
+        assistant("m2", text_block("b"), usage(5, 200, 3000, 60)),  # the same request again
+        assistant("x", text_block("Not logged in"), usage(0, 0, 0, 0), "<synthetic>"),
+        result_event(),
+    ]
+    m = parse_stream("\n".join(lines)).metrics
+    assert m.api_calls == 2  # distinct message ids of the model; the CLI's own message is not one
+    assert m.final_context_tokens == 5 + 200 + 3000
+    assert m.num_turns == 3  # the CLI's own count is kept, but it is not the request count
+    assert parse_stream("").metrics.final_context_tokens == 0
 
 
 def test_result_totals_win_over_the_assistant_sums() -> None:
@@ -495,6 +518,8 @@ FAKE_CLAUDE = textwrap.dedent(
         log.write(json.dumps(entry) + "\\n")
     stream = pathlib.Path(os.environ["FAKE_CLAUDE_STREAM"]).read_text(encoding="utf-8")
     sys.stdout.write(stream.replace("__SERVER__", server))
+    if os.environ.get("FAKE_CLAUDE_STDERR"):
+        sys.stderr.write(os.environ["FAKE_CLAUDE_STDERR"])
     """
 )
 
@@ -591,6 +616,7 @@ def test_execute_run_launches_isolated_saves_the_stream_and_grades(
             since_home=home,
             planted=planted,
             observable=planted[:16],
+            observable_a=arm_a_observable_in(world),
             timeout_s=120,
         )
     a, b = launches(fake_cli)
@@ -614,6 +640,8 @@ def test_execute_run_launches_isolated_saves_the_stream_and_grades(
     assert rec["grade"]["precision"] == 1.0
     assert rec["grade"]["recall"] == pytest.approx(6 / 18)
     assert rec["grade"]["recall_observable"] == pytest.approx(6 / 16)
+    assert rec["grade"]["recall_observable_a"] == pytest.approx(6 / 13)
+    assert rec["metrics"]["final_context_tokens"] == 1230
     json.dumps(rec)
     assert not list(out.glob("*.stderr.txt"))
 
@@ -640,6 +668,7 @@ def test_execute_run_flags_a_cli_that_cannot_work(
         since_home=tmp_path,
         planted=world.planted,
         observable=world.planted,
+        observable_a=world.planted,
         timeout_s=120,
     )
     assert "Not logged in" in rec["cli_failure"]
@@ -758,6 +787,8 @@ def make_run(
     status: str = "ok",
     cli_fail: str = "",
     malformed: bool = False,
+    api_calls: int = 4,
+    final_context: int | None = None,
 ) -> dict[str, Any]:
     observable = [(o.kind, o.ref) for o in observations(world) if o.observed]
     metrics = RunMetrics(
@@ -769,9 +800,10 @@ def make_run(
         cache_read_input_tokens=total_input * 8 // 10,
         output_tokens=total_input // 100,
         total_input_tokens=total_input,
+        final_context_tokens=total_input // 4 if final_context is None else final_context,
         cost_usd=cost,
-        num_turns=4,
-        api_calls=4,
+        num_turns=9,  # the CLI's count (tool calls + 1) is not the number of model requests
+        api_calls=api_calls,
         duration_s=12.5,
         tool_calls=7,
         tool_errors=0,
@@ -792,10 +824,11 @@ def make_run(
         "model": "sonnet",
         "max_budget_usd": 3.0,
         "wall_s": 20.5,
+        "command": ["claude", "--effort", "medium", "--system-prompt", system_prompt()],
         "metrics": metrics.to_dict(),
         "malformed": malformed,
         "cli_failure": cli_fail,
-        "grade": grade(answer, world.planted, observable).to_dict(),
+        "grade": grade(answer, world.planted, observable, arm_a_observable_in(world)).to_dict(),
     }
 
 
@@ -855,7 +888,13 @@ def test_world_block_describes_the_answer_key(world: Any) -> None:
 def test_render_report_tables_stats_and_lists(world: Any) -> None:
     text = render_report(synthetic_results(world))
     assert text.startswith("# Since benchmark report")
-    for heading in ("## The world", "## Results per arm", "## Runs", "## Most common misses"):
+    for heading in (
+        "## Method",
+        "## The world",
+        "## Results per arm",
+        "## Runs",
+        "## Most common misses",
+    ):
         assert heading in text
     # world summary
     assert (
@@ -863,18 +902,25 @@ def test_render_report_tables_stats_and_lists(world: Any) -> None:
     )
     assert text.count("- Not observable:") == 2 and "after login expiry" in text
     assert "255 messages" in text and "20 orders" in text
-    # arm A: total input mean and range, cost mean and range, recall mean
+    # arm A: mean, median and range of total input, context, cost; the counts of the record
     assert "### Arm A – raw tools (2 runs)" in text
-    assert "| Input tokens, total (incl. cache) | 200,000 | 100,000–300,000 |" in text
-    assert "| Cost (USD) | $1.000 | $0.500–$1.500 |" in text
-    assert "| Tool calls | 7 | 7 |" in text
-    assert "| Wall time (s) | 20.5 | 20.5 |" in text  # the process wall time of the record
+    assert "| Measure | Mean | Median | Min–max |" in text
+    assert "| Input tokens, total (incl. cache) | 200,000 | 200,000 | 100,000–300,000 |" in text
+    assert "| Final-request context tokens | 50,000 | 50,000 | 25,000–75,000 |" in text
+    assert "| Cost (USD) | $1.000 | $1.000 | $0.500–$1.500 |" in text
+    assert "| Tool calls | 7 | 7 | 7 |" in text
+    assert "| Wall time (s) | 20.5 | 20.5 | 20.5 |" in text  # the process wall time of the record
     # arm B: the CLI-failure run is left out of the statistics, and the cost that is unknown too
     assert "### Arm B – Since (3 runs, 1 not ok)" in text
-    assert "| Cost (USD) | $0.050 | $0.000–$0.100 |" in text
+    assert "| Cost (USD) | $0.050 | $0.050 | $0.000–$0.100 |" in text
+    assert "| Input tokens, total (incl. cache) | 16,667 | 20,000 | 0–30,000 |" in text
     assert "n/a" in text  # run B-2 has no cost
     # per-run rows
-    assert "| A | 1 | ok |" in text and "| B | 3 | error_max_budget_usd, no valid answer |" in text
+    assert (
+        "| A | 1 | ok | 7 | 4 | 100,000 | 25,000 | 10,000 | 1,000 | $0.500 | 67% | 75% | 92% "
+        "| 92% | 12/1/6 | 20.5 |"
+    ) in text
+    assert "| B | 3 | error_max_budget_usd, no valid answer |" in text
     assert "| B | 4 | CLI failure |" in text
     # misses and false positives, with the reasons
     assert "Missed (planted, not reported), most common first:" in text
@@ -883,6 +929,117 @@ def test_render_report_tables_stats_and_lists(world: Any) -> None:
     assert "po 9999999: 1/3 runs (not a planted item and not a known decoy)" in text
     unobservable = world_block(world, observations(world))["unobservable"][0]
     assert f"{unobservable['kind']} {unobservable['ref']}" in text
+
+
+def test_report_counts_model_requests_not_the_clis_turns(world: Any) -> None:
+    results = synthetic_results(world)
+    results["runs"][0]["metrics"]["api_calls"] = 5  # A-1; A-2 keeps 4
+    text = render_report(results)
+    arm_a = text.split("### Arm A")[1].split("### Arm B")[0]
+    assert "| Model requests | 4.5 | 4.5 | 4–5 |" in arm_a
+    assert "Turns" not in text and "turns" not in arm_a  # num_turns (9 in the records) is gone
+    assert "| 9 |" not in text
+    assert "| Requests |" in text  # per-run column
+
+
+def test_per_arm_table_drops_uncached_input_but_the_per_run_table_keeps_it(world: Any) -> None:
+    text = render_report(synthetic_results(world))
+    per_arm, per_run = text.split("## Runs")
+    assert "Input tokens, uncached" not in text and "Uncached" not in per_arm
+    assert "| Uncached |" in per_run and "| Final ctx |" in per_run
+    assert "Final-request context tokens" in per_arm
+
+
+def test_report_shows_the_median_next_to_the_mean_so_one_outlier_is_visible(world: Any) -> None:
+    results = synthetic_results(world)
+    results["runs"] = [
+        make_run("A", 1, world, answer=[], total_input=100_000, cost=0.10),
+        make_run("A", 2, world, answer=[], total_input=110_000, cost=0.11),
+        make_run("A", 3, world, answer=[], total_input=400_000, cost=0.40),  # the outlier
+    ]
+    text = render_report(results)
+    assert "| Input tokens, total (incl. cache) | 203,333 | 110,000 | 100,000–400,000 |" in text
+    assert "| Cost (USD) | $0.203 | $0.110 | $0.100–$0.400 |" in text
+
+
+def test_report_scores_recall_against_three_denominators_and_states_the_ceilings(
+    world: Any,
+) -> None:
+    text = render_report(synthetic_results(world))
+    arm_a = text.split("### Arm A")[1].split("### Arm B")[0]
+    # A-1 found 12 of 18 planted, 12 of the 16 Since can observe, 12 of the 13 A's tools reach;
+    # A-2 found 6 of each
+    assert "| Recall, all planted (18) | 50% | 50% | 33%–67% |" in arm_a
+    assert "| Recall, observable by Since (16 of 18) | 56% | 56% | 38%–75% |" in arm_a
+    assert "| Recall, observable by arm A's tools (13 of 18) | 69% | 69% | 46%–92% |" in arm_a
+    arm_b = text.split("### Arm B")[1].split("## Runs")[0]
+    assert "| Recall, observable by arm A's tools (13 of 18) |" in arm_b  # both arms, both rows
+    assert "| Recall, observable by Since (16 of 18) |" in arm_b
+    # the world section states the ceilings and why A's is lower
+    assert "- Observable by arm A's tools: 13 of 18." in text
+    assert "cannot see any portal order change" in text and "cannot detect portal-layout" in text
+    assert "behind a login" in text and "notes are from the last look" in text
+    assert "Out of A's reach: portal " in text and "system portal-layout" in text
+    assert text.count("Out of A's reach:") == 1
+
+
+def test_world_line_counts_business_mail_after_the_last_look(world: Any) -> None:
+    text = render_report(synthetic_results(world))
+    mails = world.state_at(NOW).mails
+    business = [m for m in mails if m.sender_kind in ("customer", "supplier")]
+    after = [m for m in business if m.received > LAST_LOOK]
+    assert len(after) < len(business)  # the total would be the wrong number
+    assert (
+        f"- Mail: 255 messages (118 after the last look; {len(after)} of those from customers "
+        "or suppliers). By sender: "
+    ) in text
+    assert f"{len(business)} from customers or suppliers" not in text
+
+
+def test_report_of_an_older_results_file_shows_n_a_instead_of_failing(world: Any) -> None:
+    results = synthetic_results(world)
+    del results["world"]["observable_a"]
+    del results["world"]["summary"]["mails_business_after_last_look"]
+    for run in results["runs"]:
+        del run["metrics"]["api_calls"], run["metrics"]["final_context_tokens"]
+        del run["grade"]["recall_observable_a"]
+    text = render_report(results)
+    assert "| Model requests | n/a | n/a | n/a |" in text
+    assert "| Recall, observable by arm A's tools | n/a | n/a | n/a |" in text
+    assert "(118 after the last look). By sender" in text
+    assert "Observable by arm A's tools" not in text.split("## Results per arm")[0]
+
+
+def test_method_section_states_how_the_runs_were_made(world: Any) -> None:
+    text = render_report(synthetic_results(world))
+    method = text.split("## Method")[1].split("## The world")[0]
+    assert "headless Claude Code session" in method
+    assert "Claude Code 2.1.284; model sonnet (resolved to claude-sonnet-5-5)" in method
+    assert '`--setting-sources ""`' in method and "no CLAUDE.md" in method
+    assert "`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`" in method
+    assert "`--strict-mcp-config`" in method and '`--tools ""`' in method
+    assert "empty temp directory" in method
+    assert f'("{system_prompt()}")' in method and "one-line neutral `--system-prompt`" in method
+    assert "much shorter than Claude Code's default system prompt" in method
+    assert "lower than in normal use" in method
+    assert "`--effort medium`" in method and "per-run budget cap $3" in method
+    assert "distinct assistant message ids" in method and "`num_turns`" in method
+    assert "final-request context tokens" in method
+    assert "three denominators" in method
+    assert "replaced by `~`" in method
+
+
+def test_method_section_reports_what_the_records_hold(world: Any) -> None:
+    results = synthetic_results(world)
+    for run in results["runs"]:
+        run["command"] = ["claude", "--effort", "high", "--system-prompt", "Be brief."]
+        run["max_budget_usd"] = 1.5
+    method = render_report(results).split("## Method")[1].split("## The world")[0]
+    assert "`--effort high`" in method and '("Be brief.")' in method and "$1.5" in method
+    for run in results["runs"]:
+        del run["command"]  # older records: the harness defaults are stated
+    method = render_report(results).split("## Method")[1].split("## The world")[0]
+    assert "`--effort medium`" in method and f'("{system_prompt()}")' in method
 
 
 def test_render_report_of_one_arm_only(world: Any) -> None:
@@ -929,6 +1086,374 @@ def test_claude_command_pins_a_neutral_system_prompt_and_effort(tmp_path: Path) 
     assert cmd[cmd.index("--system-prompt") + 1] == system_prompt()
     assert "2026-09-16 10:00 UTC" in system_prompt()
     assert cmd[cmd.index("--effort") + 1] == "medium"
-    assert run_mod.claude_command("claude", tmp_path / "mcp.json", "B", "sonnet", 3)[
-        cmd.index("--system-prompt") + 1
-    ] == system_prompt()
+    assert (
+        run_mod.claude_command("claude", tmp_path / "mcp.json", "B", "sonnet", 3)[
+            cmd.index("--system-prompt") + 1
+        ]
+        == system_prompt()
+    )
+
+
+# -- local paths: scrubbing ----------------------------------------------------------------------
+
+HOME = r"C:\Users\Tester"
+TEMP_TAIL = r"\AppData\Local\Temp\since-bench-A1-x\cwd"
+
+
+def escaped(text: str) -> str:
+    """``text`` as it appears inside a JSON string (backslashes doubled)."""
+    return json.dumps(text)[1:-1]
+
+
+def test_scrub_replaces_the_home_directory_in_every_spelling() -> None:
+    plain = HOME + TEMP_TAIL
+    assert scrub_text(plain, [HOME]) == "~" + TEMP_TAIL
+    assert scrub_text(escaped(plain), [HOME]) == escaped("~" + TEMP_TAIL)  # as JSON writes it
+    assert scrub_text("C:/Users/Tester/AppData/x", [HOME]) == "~/AppData/x"  # forward slashes
+    assert scrub_text(r"c:\users\TESTER\AppData\x", [HOME]) == r"~\AppData\x"  # any case
+    assert scrub_text(r"C:\Users/Tester\x", [HOME]) == r"~\x"  # mixed
+    assert "Tester" not in scrub_text(escaped(escaped(plain)), [HOME])  # JSON in a JSON string
+    assert scrub_text(f"cwd={HOME} and {HOME}\\x", [HOME]) == "cwd=~ and ~\\x"  # all of them
+
+
+def test_scrub_keeps_json_valid() -> None:
+    data = {"cwd": HOME + TEMP_TAIL, "list": [HOME + r"\a", "no path"], "n": 1}
+    clean = json.loads(scrub_text(json.dumps(data), [HOME]))
+    assert clean == {"cwd": "~" + TEMP_TAIL, "list": [r"~\a", "no path"], "n": 1}
+
+
+def test_scrub_leaves_other_users_and_look_alikes_alone() -> None:
+    for text in (r"C:\Users\Tester2\x", r"C:\Users\Testers", r"C:\Users\Other\Tester", "Tester"):
+        assert scrub_text(text, [HOME]) == text
+
+
+def test_scrub_normalises_the_hand_made_user_placeholder() -> None:
+    for text, want in (
+        (r"C:\Users\<user>\AppData\x", r"~\AppData\x"),
+        (r"C:\\Users\\<user>\\AppData\\x", r"~\\AppData\\x"),  # as it stands in the JSON files
+        ("C:/Users/<user>/AppData/x", "~/AppData/x"),
+        ("/Users/<user>/x", "~/x"),
+        ("/home/<user>/x", "~/x"),
+    ):
+        assert scrub_text(text, []) == want, text  # no home directory needed for that
+
+
+def test_scrub_posix_home_and_many_homes() -> None:
+    assert scrub_text("/Users/tester/Documents/x", ["/Users/tester"]) == "~/Documents/x"
+    assert scrub_text("/Users/testerx/x", ["/Users/tester"]) == "/Users/testerx/x"
+    text = "a /home/me/x b C:\\Users\\Tester\\y"
+    assert scrub_text(text, ["/home/me", HOME]) == "a ~/x b ~\\y"
+    # a home that also matches as a prefix of a longer one: the longer one wins
+    assert scrub_text("/h/me/work/x", ["/h/me", "/h/me/work"]) == "~/x"
+
+
+def test_scrub_is_idempotent_and_ignores_a_root_directory() -> None:
+    once = scrub_text(escaped(HOME + TEMP_TAIL), [HOME])
+    assert scrub_text(once, [HOME]) == once
+    text = "/usr/lib and C:\\Windows and /Users"
+    assert scrub_text(text, [Path.home().anchor]) == text  # a root would match every path
+
+
+def test_scrub_default_is_this_users_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = tmp_path / "Users" / "Tester"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    assert run_mod.local_homes()[0] == str(home)
+    assert scrub_text(f"x {home}{TEMP_TAIL} y") == f"x ~{TEMP_TAIL} y"
+    assert scrub_text(f"x {home.resolve()}{TEMP_TAIL}") == f"x ~{TEMP_TAIL}"  # symlinked temp dirs
+    assert scrub_text(escaped(f"{home}{TEMP_TAIL}")) == escaped(f"~{TEMP_TAIL}")
+
+
+def test_scrub_bytes_and_files(tmp_path: Path) -> None:
+    raw = b"\xff\xfe" + escaped(HOME + r"\x").encode() + b"\n"
+    assert scrub_bytes(raw, [HOME]) == b"\xff\xfe~\\\\x\n"  # bytes that are no UTF-8 survive
+    path = tmp_path / "stream.jsonl"
+    path.write_bytes(raw)
+    assert scrub_file(path, [HOME]) is True
+    assert path.read_bytes() == b"\xff\xfe~\\\\x\n"
+    assert scrub_file(path, [HOME]) is False  # nothing left to scrub: the file is not rewritten
+    assert [p.name for p in tmp_path.iterdir()] == ["stream.jsonl"]
+
+
+def home_stream(items: list[tuple[str, str]]) -> str:
+    """A fake CLI stream whose first event names the temp directory under the user's home."""
+    cwd = line(type="system", subtype="status", cwd=HOME + TEMP_TAIL)
+    return cwd + "\n" + stream_for(items)
+
+
+def test_execute_run_saves_stream_and_stderr_without_local_paths(
+    tmp_path: Path, fake_cli: dict[str, Path], monkeypatch: pytest.MonkeyPatch, world: Any
+) -> None:
+    monkeypatch.setattr(run_mod, "local_homes", lambda: [HOME])
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", "warning at " + HOME + r"\x")
+    fake_cli["stream"].write_text(home_stream(list(world.planted)[:3]), encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    rec = execute_run(
+        arm="A",
+        n=1,
+        out=out,
+        claude="claude",
+        model="sonnet",
+        max_budget_usd=1,
+        seed=world.seed,
+        since_home=tmp_path,
+        planted=world.planted,
+        observable=world.planted,
+        observable_a=world.planted,
+        timeout_s=120,
+    )
+    saved = (out / "A-1.jsonl").read_text(encoding="utf-8")
+    assert "Tester" not in saved and escaped("~" + TEMP_TAIL) in saved
+    assert (out / "A-1.stderr.txt").read_text(encoding="utf-8") == r"warning at ~\x"
+    assert rec["metrics"]["status"] == "ok" and len(rec["reported"]) == 3  # parsing is unaffected
+
+
+def test_write_json_and_the_report_carry_no_local_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, world: Any
+) -> None:
+    monkeypatch.setattr(run_mod, "local_homes", lambda: [HOME])
+    path = tmp_path / "results.json"
+    run_mod._write_json(path, {"cwd": HOME + TEMP_TAIL, "list": [HOME]})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"cwd": "~" + TEMP_TAIL, "list": ["~"]}
+    results = synthetic_results(world)
+    for r in results["runs"]:
+        r["command"] = ["claude", "--system-prompt", "Work in " + HOME + r"\notes."]
+    out = tmp_path / "out"
+    out.mkdir()
+    report = write_reports(out, results, tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    assert "Tester" not in report and r"Work in ~\notes." in report
+    assert (tmp_path / "REPORT.md").read_text(encoding="utf-8") == report
+
+
+def test_main_writes_results_streams_and_reports_without_local_paths(
+    tmp_path: Path,
+    fake_cli: dict[str, Path],
+    no_replay: None,
+    monkeypatch: pytest.MonkeyPatch,
+    world: Any,
+) -> None:
+    bench_dir = tmp_path / "bench"
+    bench_dir.mkdir()
+    monkeypatch.setattr(run_mod, "BENCH_DIR", bench_dir)
+    monkeypatch.setattr(run_mod, "find_claude", lambda: HOME + r"\claude.exe")
+    monkeypatch.setattr(run_mod, "local_homes", lambda: [HOME])
+    fake_cli["stream"].write_text(home_stream(list(world.planted)[:9]), encoding="utf-8")
+    out = tmp_path / "results" / "smoke"
+    assert run_main(out, "--arms", "A", "--runs", "1") == 0
+    written = [out / "results.json", out / "A-1.jsonl", out / "REPORT.md", bench_dir / "REPORT.md"]
+    for path in written:
+        assert "Tester" not in path.read_text(encoding="utf-8"), path.name
+    assert "~" in (out / "A-1.jsonl").read_text(encoding="utf-8")
+
+
+# -- --report-only ---------------------------------------------------------------------------------
+
+
+def old_format_results(root: Path, world: Any) -> Path:
+    """A results directory as the first benchmark left it: streams and ``results.json`` with the
+    user's home path (a hand-made ``<user>`` in some places), no ``api_calls`` or context size in
+    the metrics, no arm-A recall in the grades, no business-mail count in the world summary, and
+    numbers in the records that the streams contradict (they must be recomputed)."""
+    root.mkdir(parents=True)
+    planted = [tuple(x) for x in world.planted]
+    block = world_block(world, observations(world))
+    del block["observable_a"], block["summary"]["mails_business_after_last_look"]
+    runs = []
+    for arm, items in (("A", planted[:6]), ("B", planted[:9])):
+        server = "raw" if arm == "A" else "since"
+        text = home_stream(items).replace("__SERVER__", server)
+        (root / f"{arm}-1.jsonl").write_text(text, encoding="utf-8")
+        record = make_run(arm, 1, world, answer=[], total_input=1, cost=0.1)
+        del record["metrics"]["api_calls"], record["metrics"]["final_context_tokens"]
+        del record["grade"]["recall_observable_a"]
+        cmd = [HOME + r"\claude.exe", "--effort", "medium", "--system-prompt", system_prompt()]
+        record.update(
+            stream=f"{arm}-1.jsonl",
+            reported=[],
+            command=cmd,
+            mcp_config={"cwd": r"C:\Users\<user>" + TEMP_TAIL},
+            final_text="",
+            timed_out=False,
+        )
+        runs.append(record)
+    results = {"version": 1, "updated": "2026-09-29T12:00:00Z", "world": block, "runs": runs}
+    (root / "results.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+    return root
+
+
+@pytest.fixture
+def bench_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bench_dir = tmp_path / "bench"
+    bench_dir.mkdir()
+    monkeypatch.setattr(run_mod, "BENCH_DIR", bench_dir)
+    monkeypatch.setattr(run_mod, "local_homes", lambda: [HOME])
+    return bench_dir
+
+
+def snapshot(root: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(root.iterdir()) if p.is_file()}
+
+
+def test_report_only_rebuilds_scrubs_and_recomputes_from_the_streams(
+    tmp_path: Path, bench_home: Path, world: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = old_format_results(tmp_path / "results" / "old", world)
+    assert main(["--report-only", "--out", str(out)]) == 0
+    assert "nothing was run" in capsys.readouterr().out
+
+    data = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    a, b = data["runs"]
+    for record, answered in ((a, 6), (b, 9)):
+        m = record["metrics"]
+        assert m["api_calls"] == 3 and m["final_context_tokens"] == 1230  # from the stream
+        assert m["total_input_tokens"] == 60 + 1200 + 2200 and m["status"] == "ok"
+        assert m["num_turns"] == 3 and len(record["reported"]) == answered
+        assert record["wall_s"] == 20.5 and record["command"][1] == "--effort"  # kept as recorded
+    assert a["grade"]["recall_observable_a"] == pytest.approx(6 / 13)
+    # B's first 9 planted items are 7 mails and 2 POs, all of them within A's reach
+    assert b["grade"]["recall_observable_a"] == pytest.approx(9 / 13)
+    assert a["grade"]["recall"] == pytest.approx(6 / 18)
+    block = data["world"]
+    assert len(block["observable_a"]) == 13 and len(block["observable"]) == 16
+    business = block["summary"]["mails_business_after_last_look"]
+    assert 0 < business < block["summary"]["mails_business"]
+    assert data["updated"] == "2026-09-29T12:00:00Z"  # the time of the runs, not of the rebuild
+
+    for path in [*out.glob("*.jsonl"), out / "results.json", out / "REPORT.md"]:
+        text = path.read_text(encoding="utf-8")
+        assert "Tester" not in text and "<user>" not in text, path.name
+    assert "~" in (out / "A-1.jsonl").read_text(encoding="utf-8")
+    assert data["runs"][0]["mcp_config"] == {"cwd": "~" + TEMP_TAIL}
+    report = (out / "REPORT.md").read_text(encoding="utf-8")
+    assert (bench_home / "REPORT.md").read_text(encoding="utf-8") == report
+    assert "| Model requests | 3 | 3 | 3 |" in report
+    assert "| Final-request context tokens | 1,230 | 1,230 | 1,230 |" in report
+    assert f"{business} of those from customers or suppliers" in report
+    assert "Recall, observable by arm A's tools (13 of 18) | 46% | 46% | 46% |" in report
+    assert "## Method" in report and "Turns" not in report
+
+    before = snapshot(out)
+    assert main(["--report-only", "--out", str(out)]) == 0  # again: nothing changes
+    assert snapshot(out) == before
+
+
+def test_report_only_starts_no_process(
+    tmp_path: Path,
+    bench_home: Path,
+    fake_cli: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    world: Any,
+) -> None:
+    def spawned(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("--report-only started something")
+
+    for owner, name in (
+        (subprocess, "Popen"),
+        (subprocess, "run"),
+        (subprocess, "call"),
+        (subprocess, "check_output"),
+        (run_mod, "run_process"),
+        (run_mod, "find_claude"),
+        (run_mod, "execute_run"),
+        (run_mod, "replay"),
+        (run_mod, "_replay_or_reuse"),
+        (run_mod, "_run_all"),
+    ):
+        monkeypatch.setattr(owner, name, spawned)
+    out = old_format_results(tmp_path / "results" / "old", world)
+    # the run options are irrelevant here and must not start anything either
+    assert main(["--report-only", "--out", str(out), "--runs", "0", "--arms", "A,B"]) == 0
+    assert (out / "REPORT.md").exists() and (bench_home / "REPORT.md").exists()
+    assert launches(fake_cli) == []  # the fake CLI was never started
+
+
+def test_rebuild_report_without_a_second_copy(tmp_path: Path, bench_home: Path, world: Any) -> None:
+    out = old_format_results(tmp_path / "results" / "old", world)
+    assert rebuild_report(out, None) == out / "REPORT.md"
+    assert (out / "REPORT.md").exists() and not (bench_home / "REPORT.md").exists()
+
+
+def test_report_only_needs_an_existing_results_directory(
+    tmp_path: Path, bench_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--report-only"]) == 2
+    assert main(["--report-only", "--out", str(tmp_path / "nope")]) == 2
+    err = capsys.readouterr().err
+    assert "--report-only needs --out" in err and "results.json" in err and "not found" in err
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "results.json").write_text("{not json", encoding="utf-8")
+    assert main(["--report-only", "--out", str(empty)]) == 2
+    assert "not valid JSON" in capsys.readouterr().err
+    assert not (bench_home / "REPORT.md").exists()
+
+
+def test_report_only_refuses_results_of_another_answer_key(
+    tmp_path: Path, bench_home: Path, world: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = old_format_results(tmp_path / "results" / "old", world)
+    data = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    data["world"]["planted"].pop()  # the world was different when these were graded
+    (out / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    assert main(["--report-only", "--out", str(out)]) == 2
+    assert "no longer gives the answer key" in capsys.readouterr().err
+    assert not (out / "REPORT.md").exists() and not (bench_home / "REPORT.md").exists()
+    del data["world"]["summary"]["seed"]
+    (out / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    assert main(["--report-only", "--out", str(out)]) == 2
+    assert "no world summary with a seed" in capsys.readouterr().err
+
+
+def test_report_only_does_not_overwrite_a_report_with_nothing_valid(
+    tmp_path: Path, bench_home: Path, world: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = old_format_results(tmp_path / "results" / "old", world)
+    (bench_home / "REPORT.md").write_text("the good report\n", encoding="utf-8")
+    data = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    for record in data["runs"]:
+        record["cli_failure"] = "not logged in"
+    (out / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    assert main(["--report-only", "--out", str(out)]) == 2
+    assert "no valid run" in capsys.readouterr().err
+    assert (bench_home / "REPORT.md").read_text(encoding="utf-8") == "the good report\n"
+
+
+def test_report_only_keeps_what_a_stream_cannot_tell(
+    tmp_path: Path, bench_home: Path, world: Any
+) -> None:
+    out = old_format_results(tmp_path / "results" / "old", world)
+    data = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    a, b = data["runs"]
+    # A was killed after a timeout: its stream just stops (no result event)
+    lines = (out / "A-1.jsonl").read_text(encoding="utf-8").splitlines()
+    (out / "A-1.jsonl").write_text("\n".join(lines[:-1]), encoding="utf-8")
+    a.update(timed_out=True)
+    a["metrics"].update(status="timeout", is_error=True, error="killed after 60 s")
+    # B's stream is gone; its record says what it reported
+    (out / "B-1.jsonl").unlink()
+    b["reported"] = [list(item) for item in world.planted[:4]]
+    (out / "results.json").write_text(json.dumps(data), encoding="utf-8")
+    assert main(["--report-only", "--out", str(out)]) == 0
+    a, b = json.loads((out / "results.json").read_text(encoding="utf-8"))["runs"]
+    assert a["metrics"]["status"] == "timeout" and a["metrics"]["error"] == "killed after 60 s"
+    assert a["metrics"]["api_calls"] == 3  # everything else is recomputed
+    assert b["grade"]["recall"] == pytest.approx(4 / 18)  # graded from the recorded answer
+    assert b["grade"]["recall_observable_a"] == pytest.approx(4 / 13)
+    assert "api_calls" not in b["metrics"]  # no stream, no request count: shown as n/a
+    assert "| B | 1 | ok | 7 | n/a |" in (out / "REPORT.md").read_text(encoding="utf-8")
+
+
+def test_committed_results_are_scrubbed(world: Any) -> None:
+    """Whatever results are committed under bench/results (and the report) hold no ``<user>``
+    placeholder and nothing that scrubbing would still change."""
+    bench = Path(run_mod.BENCH_DIR)
+    files = [bench / "REPORT.md"]
+    for results in sorted((bench / "results").glob("*")):
+        if results.is_dir():
+            files += [results / "results.json", results / "REPORT.md", *results.glob("*.jsonl")]
+    for path in files:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            assert "<user>" not in text, path
+            assert scrub_text(text) == text, path

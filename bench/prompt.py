@@ -13,6 +13,7 @@ from datetime import datetime
 from bench.world import ETA_SLIP_DAYS, LAST_LOOK, NOW
 
 ARMS = ("A", "B")
+EFFORT = "medium"  # the CLI's --effort level, the same for both arms
 
 TOOLS = {
     "A": (

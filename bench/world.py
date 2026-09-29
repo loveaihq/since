@@ -512,6 +512,9 @@ def summary(world: World) -> dict[str, Any]:
         "mails_after_last_look": len(now.mails) - len(last.mails),
         "mails_by_sender_kind": dict(sorted(Counter(m.sender_kind for m in now.mails).items())),
         "mails_business": sum(1 for m in now.mails if m.sender_kind in BUSINESS_KINDS),
+        "mails_business_after_last_look": sum(
+            1 for m in now.mails if m.sender_kind in BUSINESS_KINDS and m.received > LAST_LOOK
+        ),
         "mail_flag_events": len(world.flag_events),
         "po_rows_at_start": len(first_po.po_rows),
         "po_rows_now": len(now.po_rows),

@@ -22,6 +22,13 @@ Per run the raw stream is saved as ``<out>/<arm>-<n>.jsonl``; metrics and the gr
 ``<out>/results.json``; the report ``<out>/REPORT.md`` is copied to ``bench/REPORT.md``. The
 runner never starts more runs than requested and stops at the first failure to start the CLI (or
 to get an answer out of it: not logged in, MCP server not connected).
+
+Local paths. Everything the runner writes (streams, ``results.json``, the reports) has this user's
+home directory replaced by ``~`` (``scrub_text``), in every spelling a path takes in JSON or text.
+
+``--report-only --out DIR`` starts nothing: it re-reads an existing results directory, scrubs it the
+same way, recomputes the metrics and grades from the saved streams (and the world facts from the
+seed), and rewrites ``DIR/REPORT.md`` and ``bench/REPORT.md``.
 """
 
 from __future__ import annotations
@@ -30,21 +37,31 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from bench.grade import Item, extract_items, grade, normalise
-from bench.prompt import ARMS, build_prompt, system_prompt
+from bench.grade import (
+    ARM_A_LIMITS,
+    Item,
+    arm_a_observable_in,
+    extract_items,
+    grade,
+    normalise,
+)
+from bench.prompt import ARMS, EFFORT, build_prompt, system_prompt
 from bench.replay import (
     MIN_SCHEDULE_S,
     Observation,
@@ -204,7 +221,7 @@ def claude_command(
         "--system-prompt",
         system_prompt(),
         "--effort",
-        "medium",
+        EFFORT,
         "--model",
         model,
         "--max-budget-usd",
@@ -311,7 +328,8 @@ class RunMetrics:
     assistant messages; ``turn_usage`` is always the latter (each message counted once). Input
     counts of the two agree; the output count of an assistant event is the value at the start of
     the message (the CLI does not update it), so ``turn_usage`` undercounts output tokens: the
-    ``result`` totals are the ones to trust."""
+    ``result`` totals are the ones to trust. ``final_context_tokens`` is the input (including
+    cache) of the last model request: the size of the context the model held when it answered."""
 
     status: str  # ok | error | no_result | <the result subtype, e.g. error_max_budget_usd>
     is_error: bool
@@ -320,7 +338,8 @@ class RunMetrics:
     cache_creation_input_tokens: int
     cache_read_input_tokens: int
     output_tokens: int
-    total_input_tokens: int  # the three input kinds together
+    total_input_tokens: int  # the three input kinds together, summed over all requests
+    final_context_tokens: int  # the three input kinds of the last model request alone
     cost_usd: float | None
     num_turns: int
     api_calls: int  # distinct assistant messages produced by the model
@@ -471,6 +490,7 @@ def parse_stream(text: str, wall_s: float = 0.0) -> Parsed:
         cache_read_input_tokens=usage["cache_read_input_tokens"],
         output_tokens=usage["output_tokens"],
         total_input_tokens=_total_input(usage),
+        final_context_tokens=_total_input(usage_by_msg[real[-1]]) if real else 0,
         cost_usd=float(cost)
         if isinstance(cost, (int, float)) and not isinstance(cost, bool)
         else None,
@@ -519,6 +539,68 @@ def cli_failure(metrics: RunMetrics, arm: str, proc: ProcResult) -> str:
     return ""
 
 
+# -- local paths ---------------------------------------------------------------------------------
+
+HOME_MARK = "~"
+_SEP = r"[\\/]+"  # one path separator in any spelling: \, \\ (as JSON writes it) or /
+# a home directory whose user name was replaced by hand, in any spelling
+_PLACEHOLDER_HOME = rf"(?:[A-Za-z]:)?{_SEP}(?:Users|home){_SEP}<user>"
+
+
+def local_homes() -> list[str]:
+    """The home directory of the user running the benchmark (as given, and resolved)."""
+    homes: list[str] = []
+    try:
+        candidates = [Path.home(), Path.home().resolve()]
+    except (RuntimeError, OSError):
+        return homes
+    for candidate in candidates:
+        if str(candidate) not in homes:
+            homes.append(str(candidate))
+    return homes
+
+
+def _home_regex(home: str) -> str | None:
+    """A regex for ``home`` with any separator spelling (see ``_SEP``) and any letter case;
+    ``None`` for a filesystem root (it would match every path)."""
+    parts = [part for part in re.split(r"[\\/]+", home) if part]
+    if not parts or Path(home).parent == Path(home):
+        return None
+    lead = _SEP if home[:1] in ("\\", "/") else ""
+    return lead + _SEP.join(re.escape(part) for part in parts)
+
+
+def scrub_text(text: str, homes: Iterable[str | Path] | None = None) -> str:
+    """``text`` with the user's home directory (``homes``; default: this user's) replaced by
+    ``~``. The path may be plain (``C:\\Users\\me\\x``), as JSON escapes it (``C:\\\\Users\\\\me``),
+    written with forward slashes, or in another letter case; the tail of the path is kept. A path
+    that only starts with the same characters (``C:\\Users\\me2``) is left alone. The ``<user>``
+    placeholder of a hand-scrubbed file is normalised the same way. Idempotent."""
+    candidates = local_homes() if homes is None else [str(home) for home in homes]
+    alternatives = sorted(filter(None, map(_home_regex, candidates)), key=len, reverse=True)
+    alternatives.append(_PLACEHOLDER_HOME)
+    pattern = re.compile("(?:" + "|".join(alternatives) + r")(?!\w)", re.IGNORECASE)
+    return pattern.sub(HOME_MARK, text)
+
+
+def scrub_bytes(data: bytes, homes: Iterable[str | Path] | None = None) -> bytes:
+    """``scrub_text`` for raw output (bytes that are not UTF-8 pass through unchanged)."""
+    text = data.decode("utf-8", "surrogateescape")
+    return scrub_text(text, homes).encode("utf-8", "surrogateescape")
+
+
+def scrub_file(path: Path, homes: Iterable[str | Path] | None = None) -> bool:
+    """Scrub a file in place; returns whether it changed (an unchanged file is not touched)."""
+    data = path.read_bytes()
+    clean = scrub_bytes(data, homes)
+    if clean == data:
+        return False
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(clean)
+    os.replace(tmp, path)
+    return True
+
+
 # -- one run -------------------------------------------------------------------------------------
 
 
@@ -546,9 +628,10 @@ def _say(text: str) -> None:
 
 
 def _write_json(path: Path, data: Any) -> None:
-    """Write JSON atomically (a crash never leaves half a results file)."""
+    """Write JSON atomically (a crash never leaves half a results file), without local paths."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    text = scrub_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n")
+    tmp.write_text(text, encoding="utf-8", newline="\n")
     os.replace(tmp, path)
 
 
@@ -564,10 +647,12 @@ def execute_run(
     since_home: Path,
     planted: list[Item],
     observable: list[Item],
+    observable_a: list[Item],
     timeout_s: float,
 ) -> dict[str, Any]:
-    """One headless run of one arm: launch, save the stream, parse, grade. Returns the record
-    that goes into ``results.json`` (``cli_failure`` is non-empty when the runs must stop)."""
+    """One headless run of one arm: launch, save the stream (without local paths), parse, grade.
+    Returns the record that goes into ``results.json`` (``cli_failure`` is non-empty when the
+    runs must stop)."""
     work = Path(tempfile.mkdtemp(prefix=f"since-bench-{arm}{n}-"))
     try:
         cwd = work / "cwd"
@@ -592,16 +677,17 @@ def execute_run(
         shutil.rmtree(work, ignore_errors=True)
 
     stream_name = f"{arm}-{n}.jsonl"
-    (out / stream_name).write_bytes(proc.stdout)
+    stdout = scrub_bytes(proc.stdout)
+    (out / stream_name).write_bytes(stdout)
     if proc.stderr.strip():
-        (out / f"{arm}-{n}.stderr.txt").write_bytes(proc.stderr)
-    parsed = parse_stream(proc.stdout.decode("utf-8", "replace"), proc.wall_s)
+        (out / f"{arm}-{n}.stderr.txt").write_bytes(scrub_bytes(proc.stderr))
+    parsed = parse_stream(stdout.decode("utf-8", "replace"), proc.wall_s)
     metrics = parsed.metrics
     if proc.timed_out:
         metrics.status, metrics.is_error = "timeout", True
         metrics.error = f"killed after {timeout_s:g} s"
     extraction = extract_items(parsed.final_text)
-    result = grade(extraction.items, planted, observable)
+    result = grade(extraction.items, planted, observable, observable_a)
     return {
         "arm": arm,
         "run": n,
@@ -628,18 +714,27 @@ def execute_run(
 # -- results and report --------------------------------------------------------------------------
 
 
-def world_block(world: World, observations: list[Observation]) -> dict[str, Any]:
-    """The part of ``results.json`` the report needs to describe the world and the answer key."""
+def world_facts(world: World) -> dict[str, Any]:
+    """The part of the world block that follows from the world alone (no replay needed)."""
     return {
         "summary": world.summary(),
         "planted": [list(item) for item in world.planted],
+        "observable_a": [list(item) for item in arm_a_observable_in(world)],
+        "decoys": [{"kind": k, "ref": r, "why": why} for k, r, why in world.decoys],
+    }
+
+
+def world_block(world: World, observations: list[Observation]) -> dict[str, Any]:
+    """The part of ``results.json`` the report needs to describe the world and the answer key:
+    ``world_facts`` plus what the replay says Since can observe."""
+    return {
+        **world_facts(world),
         "observable": [[o.kind, o.ref] for o in observations if o.observed],
         "unobservable": [
             {"kind": o.kind, "ref": o.ref, "reason": o.reason}
             for o in observations
             if not o.observed
         ],
-        "decoys": [{"kind": k, "ref": r, "why": why} for k, r, why in world.decoys],
     }
 
 
@@ -651,6 +746,11 @@ def _num(value: float) -> str:
     return f"{value:,.0f}"
 
 
+def _count(value: float) -> str:
+    """A small count (requests, tool calls): a mean like 3.3 keeps its decimal, a whole 3 not."""
+    return f"{value:,.1f}".removesuffix(".0")
+
+
 def _usd(value: float) -> str:
     return f"${value:.3f}"
 
@@ -659,19 +759,45 @@ def _flt(value: float) -> str:
     return f"{value:.1f}"
 
 
-# (row label, getter over a run record -> number or None, formatter)
-_MEASURES = (
-    ("Input tokens, total (incl. cache)", lambda r: r["metrics"]["total_input_tokens"], _num),
-    ("Input tokens, uncached", lambda r: r["metrics"]["input_tokens"], _num),
-    ("Output tokens", lambda r: r["metrics"]["output_tokens"], _num),
-    ("Tool calls", lambda r: r["metrics"]["tool_calls"], _num),
-    ("Turns", lambda r: r["metrics"]["num_turns"], _num),
-    ("Recall", lambda r: r["grade"]["recall"], _pct),
-    ("Recall on observable items", lambda r: r["grade"]["recall_observable"], _pct),
-    ("Precision", lambda r: r["grade"]["precision"], _pct),
-    ("Cost (USD)", lambda r: r["metrics"]["cost_usd"], _usd),
-    ("Wall time (s)", lambda r: r.get("wall_s", r["metrics"]["duration_s"]), _flt),
-)
+def _cell(value: float | None, fmt: Any) -> str:
+    return "n/a" if value is None else str(fmt(value))
+
+
+def _metric(name: str) -> Any:
+    return lambda r: r["metrics"].get(name)
+
+
+def _grade_of(name: str) -> Any:
+    return lambda r: r["grade"].get(name)
+
+
+def _measures(world: dict[str, Any]) -> tuple[tuple[str, Any, Any], ...]:
+    """(row label, getter over a run record -> number or None, formatter). The recall rows say
+    how many planted items they are out of (the ceiling of that row)."""
+    planted = len(world["planted"])
+    a_items = world.get("observable_a")
+    a_ceiling = "" if a_items is None else f" ({len(a_items)} of {planted})"
+    return (
+        ("Model requests", _metric("api_calls"), _count),
+        ("Tool calls", _metric("tool_calls"), _count),
+        ("Input tokens, total (incl. cache)", _metric("total_input_tokens"), _num),
+        ("Final-request context tokens", _metric("final_context_tokens"), _num),
+        ("Output tokens", _metric("output_tokens"), _num),
+        (f"Recall, all planted ({planted})", _grade_of("recall"), _pct),
+        (
+            f"Recall, observable by Since ({len(world['observable'])} of {planted})",
+            _grade_of("recall_observable"),
+            _pct,
+        ),
+        (
+            f"Recall, observable by arm A's tools{a_ceiling}",
+            _grade_of("recall_observable_a"),
+            _pct,
+        ),
+        ("Precision", _grade_of("precision"), _pct),
+        ("Cost (USD)", _metric("cost_usd"), _usd),
+        ("Wall time (s)", lambda r: r.get("wall_s", r["metrics"].get("duration_s")), _flt),
+    )
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
@@ -680,13 +806,14 @@ def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
-def _stats(runs: list[dict[str, Any]], getter: Any, fmt: Any) -> tuple[str, str]:
+def _stats(runs: list[dict[str, Any]], getter: Any, fmt: Any) -> tuple[str, str, str]:
+    """Mean, median and min–max of a measure over the runs (a run without a value is left out)."""
     values = [v for v in (getter(r) for r in runs) if v is not None]
     if not values:
-        return "n/a", "n/a"
-    mean = sum(values) / len(values)
+        return "n/a", "n/a", "n/a"
+    mean, median = sum(values) / len(values), statistics.median(values)
     low, high = min(values), max(values)
-    return fmt(mean), fmt(low) if low == high else f"{fmt(low)}–{fmt(high)}"
+    return fmt(mean), fmt(median), fmt(low) if low == high else f"{fmt(low)}–{fmt(high)}"
 
 
 def _common(runs: list[dict[str, Any]], which: str) -> list[tuple[Item, int]]:
@@ -703,11 +830,14 @@ def _world_lines(world: dict[str, Any]) -> list[str]:
     kinds = ", ".join(f"{k} {v}" for k, v in by_kind.items())
     senders = ", ".join(f"{k} {v}" for k, v in s.get("mails_by_sender_kind", {}).items())
     planted, observable = len(world["planted"]), len(world["observable"])
+    business = s.get("mails_business_after_last_look")
+    after = f"{s['mails_after_last_look']} after the last look"
+    if business is not None:
+        after += f"; {business} of those from customers or suppliers"
     lines = [
         f"- Seed {s['seed']}. Simulated time {s['start']} to {s['now']}; the agent last looked at "
         f"{s['last_look']}.",
-        f"- Mail: {s['mails_total']} messages ({s['mails_after_last_look']} after the last look; "
-        f"{s['mails_business']} from customers or suppliers). By sender: {senders}.",
+        f"- Mail: {s['mails_total']} messages ({after}). By sender: {senders}.",
         f"- PO table: {s['po_rows_now']} rows now, {s['po_changes']} changes over the three days "
         f"({s['po_changes_after_last_look']} after the last look).",
         f"- Portal: {s['portal_orders']} orders, {s['portal_changes']} changes "
@@ -723,7 +853,67 @@ def _world_lines(world: dict[str, Any]) -> list[str]:
             "was made when the portal could no longer be read; only the two system items "
             "report that."
         )
+    a_items = world.get("observable_a")
+    if a_items is not None:
+        reachable = {normalise(*item) for item in a_items}
+        beyond = [f"{k} {r}" for k, r in world["planted"] if normalise(k, r) not in reachable]
+        line = f"- Observable by arm A's tools: {len(a_items)} of {planted}."
+        if beyond:
+            line += f" {ARM_A_LIMITS}. Out of A's reach: {', '.join(beyond)}."
+        lines.append(line)
     return lines
+
+
+def _flag_value(runs: list[dict[str, Any]], flag: str) -> str | None:
+    """The value after ``flag`` in the command line recorded for the runs (first that has it)."""
+    for run in runs:
+        command = run.get("command")
+        if isinstance(command, list) and flag in command:
+            at = command.index(flag) + 1
+            if at < len(command):
+                return str(command[at])
+    return None
+
+
+def _method_lines(runs: list[dict[str, Any]], cap: float) -> list[str]:
+    """The method section: how the runs were made and what the numbers are (D35). Values that
+    the record of the runs holds (version, model, effort, system prompt) are taken from it."""
+    versions = sorted({r["metrics"].get("claude_version") or "" for r in runs} - {""})
+    aliases = sorted({r["model"] for r in runs})
+    resolved = sorted({r["metrics"].get("model") or "" for r in runs} - {""})
+    model = ", ".join(aliases) + (f" (resolved to {', '.join(resolved)})" if resolved else "")
+    effort = _flag_value(runs, "--effort") or EFFORT
+    prompt = _flag_value(runs, "--system-prompt") or system_prompt()
+    return [
+        "Every run is one headless Claude Code session (`claude -p --output-format stream-json "
+        "--verbose`), started by `bench/run.py` in an empty temp directory. Both arms get the "
+        "same task prompt; only its tool paragraph differs.",
+        "",
+        f"- Claude Code {', '.join(versions) or 'unknown'}; model {model}.",
+        "- Only the arm's MCP server is loaded (`--strict-mcp-config`); no built-in tools "
+        '(`--tools ""`); `--allowedTools` names that server only.',
+        '- Nothing else of this machine reaches the agent: `--setting-sources ""` (no user, '
+        "project or local settings, so no CLAUDE.md and no hooks), auto-memory off "
+        "(`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`), and an environment without the calling "
+        "session's `CLAUDECODE` / `CLAUDE_*` variables.",
+        "- System prompt: a one-line neutral `--system-prompt` that states the simulated now "
+        f'("{prompt}"). '
+        "It is much shorter than Claude Code's default system prompt, so absolute token counts "
+        "here are lower than in normal use; both arms get the same one.",
+        f"- `--effort {effort}`; per-run budget cap ${cap:g} (`--max-budget-usd`); "
+        "`--no-session-persistence`.",
+        "- Counted from the raw stream: model requests = distinct assistant message ids "
+        "(`api_calls`; the CLI's own `num_turns`, tool calls + 1, is not used); tool calls = "
+        "`tool_use` blocks; input tokens = uncached + cache-creation + cache-read input, summed "
+        "over all requests (so the context is counted again at every request); final-request "
+        "context tokens = the same three kinds for the last request alone, the size of what the "
+        "model had to hold when it answered; output tokens and cost are the CLI's totals.",
+        "- Grading: references are normalised and duplicates counted once; recall is scored "
+        "against three denominators (all planted items, the items Since can observe, the items "
+        "arm A's tools can reach); precision = correct reported / reported.",
+        f"- Local home directories in the committed results (`results.json`, the raw streams, "
+        f"this report) are replaced by `{HOME_MARK}`.",
+    ]
 
 
 def _misses_lines(arm_runs: list[dict[str, Any]], world: dict[str, Any]) -> list[str]:
@@ -753,16 +943,13 @@ def render_report(results: dict[str, Any]) -> str:
     """REPORT.md from a results dict (see ``results.json``)."""
     world, runs = results["world"], results["runs"]
     valid = [r for r in runs if not r.get("cli_failure")]
-    models = sorted({r["model"] for r in runs})
-    versions = sorted({r["metrics"]["claude_version"] for r in runs} - {""})
     per_arm = {arm: [r for r in valid if r["arm"] == arm] for arm in ARMS}
     counts = ", ".join(f"arm {arm}: {len(rs)}" for arm, rs in per_arm.items() if rs) or "none"
+    cap = max((r["max_budget_usd"] for r in runs), default=0)
     lines = [
         "# Since benchmark report",
         "",
-        f"Generated {results.get('updated', '')}. Runs: {counts}. Model: {', '.join(models)}. "
-        f"Claude Code {', '.join(versions) or 'unknown'}. Per-run budget cap: "
-        f"${max((r['max_budget_usd'] for r in runs), default=0):g}.",
+        f"Generated {results.get('updated', '')}. Runs: {counts}.",
         "",
         "The task (one prompt for both arms, only the tool paragraph differs): list everything "
         "that needs attention since the last look, by four explicit rules; the final answer is "
@@ -770,14 +957,21 @@ def render_report(results: dict[str, Any]) -> str:
         "SQL and portal tools plus the notes saved at the last look (the agent diffs in its own "
         "context). Arm B: the Since MCP tools over a replay of the same world.",
         "",
+        "## Method",
+        "",
+        *_method_lines(runs, cap),
+        "",
         "## The world",
         "",
         *_world_lines(world),
         "",
         "## Results per arm",
         "",
-        "Cells are mean, then min–max over the runs of the arm.",
+        "Cells are mean, median, then min–max over the runs of the arm. Recall is scored "
+        "against three denominators, and the ceiling of each is in its row label: all planted "
+        "items; the items Since can observe; the items arm A's tools can reach.",
     ]
+    measures = _measures(world)
     for arm, arm_runs in per_arm.items():
         if not arm_runs:
             continue
@@ -785,24 +979,23 @@ def render_report(results: dict[str, Any]) -> str:
         note = f", {len(bad)} not ok" if bad else ""
         noun = "run" if len(arm_runs) == 1 else "runs"
         lines += ["", f"### Arm {arm} – {ARM_SPECS[arm].label} ({len(arm_runs)} {noun}{note})", ""]
-        rows = []
-        for label, getter, fmt in _MEASURES:
-            mean, span = _stats(arm_runs, getter, fmt)
-            rows.append([label, mean, span])
-        lines += _table(["Measure", "Mean", "Min–max"], rows)
+        rows = [[label, *_stats(arm_runs, getter, fmt)] for label, getter, fmt in measures]
+        lines += _table(["Measure", "Mean", "Median", "Min–max"], rows)
     lines += ["", "## Runs", ""]
     headers = [
         "Arm",
         "Run",
         "Status",
         "Tool calls",
-        "Turns",
+        "Requests",
         "Input total",
+        "Final ctx",
         "Uncached",
         "Output",
         "Cost",
         "Recall",
-        "Recall obs.",
+        "Recall (Since)",
+        "Recall (A)",
         "Precision",
         "TP/FP/FN",
         "Time (s)",
@@ -813,26 +1006,33 @@ def render_report(results: dict[str, Any]) -> str:
         status = m["status"] + (", no valid answer" if r.get("malformed") else "")
         if r.get("cli_failure"):
             status = "CLI failure"
-        cost = "n/a" if m["cost_usd"] is None else _usd(m["cost_usd"])
         rows.append(
             [
                 r["arm"],
                 str(r["run"]),
                 status,
                 str(m["tool_calls"]),
-                str(m["num_turns"]),
+                _cell(m.get("api_calls"), _num),
                 _num(m["total_input_tokens"]),
+                _cell(m.get("final_context_tokens"), _num),
                 _num(m["input_tokens"]),
                 _num(m["output_tokens"]),
-                cost,
+                _cell(m["cost_usd"], _usd),
                 _pct(g["recall"]),
-                _pct(g["recall_observable"]),
+                _cell(g.get("recall_observable"), _pct),
+                _cell(g.get("recall_observable_a"), _pct),
                 _pct(g["precision"]),
                 f"{len(g['tp'])}/{len(g['fp'])}/{len(g['fn'])}",
                 _flt(r.get("wall_s", m["duration_s"])),
             ]
         )
     lines += _table(headers, rows)
+    lines += [
+        "",
+        "Requests = model requests. Final ctx = final-request context tokens. Uncached = input "
+        "tokens neither read from nor written to the cache. Recall (Since) / (A) = recall on the "
+        "items observable by Since / by arm A's tools.",
+    ]
     lines += ["", "## Most common misses and false positives"]
     for arm, arm_runs in per_arm.items():
         if arm_runs:
@@ -846,12 +1046,91 @@ def render_report(results: dict[str, Any]) -> str:
 
 
 def write_reports(out: Path, results: dict[str, Any], publish_to: Path | None) -> Path:
-    """Write ``<out>/REPORT.md`` and, if ``publish_to`` is given, a copy there."""
+    """Write ``<out>/REPORT.md`` (without local paths) and, if ``publish_to`` is given, a copy
+    there."""
     report = out / "REPORT.md"
-    report.write_text(render_report(results), encoding="utf-8", newline="\n")
+    report.write_text(scrub_text(render_report(results)), encoding="utf-8", newline="\n")
     if publish_to is not None:
         shutil.copyfile(report, publish_to)
     return report
+
+
+# -- rebuilding a report from saved results (--report-only) --------------------------------------
+
+
+def refresh_run(
+    record: dict[str, Any],
+    out: Path,
+    planted: list[Item],
+    observable: list[Item],
+    observable_a: list[Item],
+) -> None:
+    """Recompute one run record from its saved stream, if the stream is there: the metrics (a
+    stream holds everything but the process wall time and the timeout, which stay as recorded),
+    the answer, and the grade against the three answer keys. Without a stream the reported items
+    of the record are graded again."""
+    stream = out / Path(str(record.get("stream", ""))).name
+    items = [(str(kind), str(ref)) for kind, ref in record.get("reported", [])]
+    if stream.is_file():
+        text = stream.read_bytes().decode("utf-8", "replace")
+        parsed = parse_stream(text, float(record.get("wall_s") or 0.0))
+        metrics = parsed.metrics.to_dict()
+        if record.get("timed_out"):  # a kill leaves no trace in the stream
+            for key in ("status", "is_error", "error"):
+                if key in record.get("metrics", {}):
+                    metrics[key] = record["metrics"][key]
+        extraction = extract_items(parsed.final_text)
+        record.update(
+            metrics=metrics,
+            malformed=extraction.malformed,
+            extract_note=extraction.note,
+            reported=[list(item) for item in extraction.items],
+            final_text=parsed.final_text,
+        )
+        items = extraction.items
+    record["grade"] = grade(items, planted, observable, observable_a).to_dict()
+
+
+def refresh_results(out: Path, results: dict[str, Any]) -> None:
+    """Bring a loaded ``results.json`` up to date without running anything: the world facts are
+    rebuilt from the seed (which must still produce the same answer key), and every run is
+    recomputed from its stream. What the replay said Since can observe is kept as recorded."""
+    block = results.get("world")
+    try:
+        seed = int(block["summary"]["seed"])
+    except (KeyError, TypeError, ValueError):
+        raise BenchError("results.json has no world summary with a seed") from None
+    facts = world_facts(build_world(seed))
+    if block.get("planted") != facts["planted"]:
+        raise BenchError(
+            f"the world of seed {seed} no longer gives the answer key these results were graded "
+            "against; rebuild the report with the code version that made them"
+        )
+    block.update(facts)
+    planted = [(k, r) for k, r in block["planted"]]
+    observable = [(k, r) for k, r in block["observable"]]
+    observable_a = [(k, r) for k, r in block["observable_a"]]
+    for record in results.get("runs", []):
+        refresh_run(record, out, planted, observable, observable_a)
+
+
+def rebuild_report(out: Path, publish_to: Path | None) -> Path:
+    """``--report-only``: scrub the results directory ``out``, recompute it from the streams and
+    rewrite ``<out>/REPORT.md`` (and ``publish_to``). Starts no process."""
+    results_path = out / "results.json"
+    if not results_path.is_file():
+        raise BenchError(f"{results_path} not found: --out must be an existing results directory")
+    for path in [*sorted(out.glob("*.jsonl")), *sorted(out.glob("*.stderr.txt"))]:
+        scrub_file(path)
+    try:
+        results = json.loads(scrub_text(results_path.read_text(encoding="utf-8")))
+    except ValueError as exc:
+        raise BenchError(f"{results_path} is not valid JSON: {exc}") from exc
+    refresh_results(out, results)
+    if not any(not r.get("cli_failure") for r in results.get("runs", [])):
+        raise BenchError(f"{results_path} holds no valid run: nothing to report")
+    _write_json(results_path, results)
+    return write_reports(out, results, publish_to)
 
 
 # -- the command line ----------------------------------------------------------------------------
@@ -902,7 +1181,7 @@ def _summary_line(record: dict[str, Any]) -> str:
     cost = "n/a" if m["cost_usd"] is None else _usd(m["cost_usd"])
     return (
         f"{record['arm']}-{record['run']}: {m['status']}, {m['tool_calls']} tool calls, "
-        f"{m['num_turns']} turns, {m['total_input_tokens']:,} input tokens, {cost}, "
+        f"{m['api_calls']} model requests, {m['total_input_tokens']:,} input tokens, {cost}, "
         f"recall {_pct(g['recall'])} ({len(g['tp'])}/{len(g['tp']) + len(g['fn'])}), "
         f"precision {_pct(g['precision'])}"
     )
@@ -930,7 +1209,11 @@ def _run_all(args: argparse.Namespace) -> int:
     results["world"] = world_block(world, observations)
     planted = [tuple(item) for item in results["world"]["planted"]]
     observable = [tuple(item) for item in results["world"]["observable"]]
-    _say(f"world: {len(planted)} planted items, {len(observable)} observable; claude: {claude}")
+    observable_a = [tuple(item) for item in results["world"]["observable_a"]]
+    _say(
+        f"world: {len(planted)} planted items, {len(observable)} observable by Since, "
+        f"{len(observable_a)} by arm A's tools; claude: {claude}"
+    )
 
     failure = ""
     try:
@@ -949,6 +1232,7 @@ def _run_all(args: argparse.Namespace) -> int:
                     since_home=out / "since-home",
                     planted=planted,
                     observable=observable,
+                    observable_a=observable_a,
                     timeout_s=args.timeout_s,
                 )
                 results["runs"].append(record)
@@ -965,6 +1249,15 @@ def _run_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_only(args: argparse.Namespace) -> int:
+    if args.out is None:
+        raise BenchError("--report-only needs --out <an existing results directory>")
+    out = Path(args.out).resolve()
+    report = rebuild_report(out, BENCH_DIR / "REPORT.md")
+    _say(f"report: {report} (copied to {BENCH_DIR / 'REPORT.md'}); nothing was run")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m bench.run",
@@ -978,9 +1271,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--channel", choices=("msedge", "chrome"), default=None)
     parser.add_argument("--out", type=Path, default=None, help="default bench/results/<UTC stamp>")
     parser.add_argument("--timeout-s", type=float, default=1800, help="wall-time cap per run")
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="run nothing: re-read --out, scrub local paths, recompute from the streams and "
+        "rewrite REPORT.md (and bench/REPORT.md)",
+    )
     args = parser.parse_args(argv)
     try:
-        return _run_all(args)
+        return _report_only(args) if args.report_only else _run_all(args)
     except BenchError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

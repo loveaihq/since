@@ -1036,6 +1036,14 @@ def test_summary_counts_for_the_report(world: World) -> None:
         s["mails_business"]
         == s["mails_by_sender_kind"]["customer"] + s["mails_by_sender_kind"]["supplier"]
     )
+    business_after = [
+        m
+        for m in world.state_at(NOW).mails
+        if m.sender_kind in ("customer", "supplier") and m.received > LAST_LOOK
+    ]
+    assert s["mails_business_after_last_look"] == len(business_after)
+    assert 0 < s["mails_business_after_last_look"] < s["mails_business"]
+    assert s["mails_business_after_last_look"] < s["mails_after_last_look"]
     assert (
         s["po_rows_at_start"] >= 50
         and s["po_rows_now"] == s["po_rows_at_start"] + s["po_rows_created"]
